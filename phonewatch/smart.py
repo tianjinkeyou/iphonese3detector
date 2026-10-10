@@ -1,42 +1,10 @@
 """Smart positive evidence first; conservative reference fallback on misses."""
 import cv2
 import numpy as np
-from .reference import feature, ReferenceDetector
 
 
 def _reference_evidence(references, image):
-    """Bounded translations/rotations, never an unrestricted background match."""
-    if not references.ready:
-        return None, 'fallback: press R, E=empty, F=phone', None
-    if any(ref.shape != image.shape for ref in references.images.values()):
-        return None, 'fallback: area changed; recalibrate R/E/F', None
-    gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-    if np.percentile(gray,95) < 8:
-        return None, 'too dark; counting time', None
-    current=feature(image)
-    empty=feature(references.images['empty'])
-    phone=feature(references.images['phone'])
-    separation=ReferenceDetector.distance(empty,phone)
-    if separation < .025:
-        return None, 'fallback: references too similar; redo R/E/F', None
-    # Features are 96x128; allow ~6% camera/stand jitter and +/-5 degrees.
-    distances=[]
-    for ref in (empty,phone):
-        best=float('inf')
-        for angle in (-5,0,5):
-            matrix=cv2.getRotationMatrix2D((48,64),angle,1)
-            rotated=tuple(cv2.warpAffine(channel,matrix,(96,128)) for channel in ref)
-            for dx in (-6,-3,0,3,6):
-                for dy in (-6,-3,0,3,6):
-                    aligned=tuple(channel[10+dy:118+dy,10+dx:86+dx] for channel in rotated)
-                    target=tuple(channel[10:118,10:86] for channel in current)
-                    best=min(best,ReferenceDetector.distance(aligned,target))
-        distances.append(best)
-    de,dp=distances
-    evidence={"empty":de,"phone":dp}
-    if abs(de-dp) < max(.012,separation*.2) or min(de,dp) > max(.08,separation*.65):
-        return None,f'fallback uncertain E={de:.3f} F={dp:.3f}',evidence
-    return dp < de,f'fallback R/E/F E={de:.3f} F={dp:.3f}',evidence
+    return references.evidence(image, moving=True)
 
 
 def moving_reference(references,image):
@@ -52,70 +20,78 @@ class SmartDetector:
         self.model_failed=False
         self.sift=cv2.SIFT_create(nfeatures=700,contrastThreshold=.015)
         self.cache=None
-        self.keypoints=None
-        self.descriptors=None
+        self.templates=[]
 
-    def _learn(self):
-        if not self.references.ready:
-            self.cache=None
-            self.keypoints,self.descriptors=None,None
-            return
-        phone=self.references.images['phone']
-        empty=self.references.images['empty']
-        cache=(id(phone),id(empty))
+    def _learn(self, shape):
+        cache = (self.references.revision, tuple(shape))
         if self.cache == cache:
             return
-        self.cache=cache
-        self.keypoints,self.descriptors=None,None
-        if phone.shape != empty.shape:
+        self.cache = cache
+        self.templates = []
+        phones = self.references.compatible('phone',shape)
+        empties = self.references.compatible('empty',shape)
+        if not phones or not empties:
             return
-        pg=cv2.cvtColor(phone,cv2.COLOR_BGR2GRAY)
-        eg=cv2.cvtColor(empty,cv2.COLOR_BGR2GRAY)
-        # Match features of the object added by F, excluding static background.
-        difference=cv2.absdiff(cv2.GaussianBlur(pg,(5,5),0),cv2.GaussianBlur(eg,(5,5),0))
-        mask=np.uint8(difference>25)*255
-        mask=cv2.dilate(mask,np.ones((5,5),np.uint8))
-        self.keypoints,self.descriptors=self.sift.detectAndCompute(pg,mask)
-        # E/F can differ slightly in exposure or position. Remove features also
-        # recognizable on the empty stand instead of learning those as phone.
-        _,background=self.sift.detectAndCompute(eg,None)
-        if self.descriptors is not None and background is not None and len(background)>=2:
-            pairs=cv2.BFMatcher().knnMatch(self.descriptors,background,k=2)
-            reused={pair[0].queryIdx for pair in pairs if len(pair)==2 and pair[0].distance<250 and pair[0].distance<.7*pair[1].distance}
-            keep=[i for i in range(len(self.descriptors)) if i not in reused]
-            self.keypoints=[self.keypoints[i] for i in keep]
-            self.descriptors=self.descriptors[keep] if keep else None
+        backgrounds = []
+        for empty in empties:
+            eg = cv2.cvtColor(empty,cv2.COLOR_BGR2GRAY)
+            _,descriptors = self.sift.detectAndCompute(eg,None)
+            backgrounds.append((eg,descriptors))
+        matcher = cv2.BFMatcher()
+        for phone in phones:
+            pg = cv2.cvtColor(phone,cv2.COLOR_BGR2GRAY)
+            # Use the closest empty scene to isolate this pose's added object.
+            eg,_ = min(backgrounds,key=lambda item: float(cv2.absdiff(pg,item[0]).mean()))
+            difference = cv2.absdiff(cv2.GaussianBlur(pg,(5,5),0),cv2.GaussianBlur(eg,(5,5),0))
+            mask = cv2.dilate(np.uint8(difference>25)*255,np.ones((5,5),np.uint8))
+            keypoints,descriptors = self.sift.detectAndCompute(pg,mask)
+            if descriptors is None:
+                continue
+            reused = set()
+            # Exclude features recognizable in ANY empty sample.
+            for _,background in backgrounds:
+                if background is None or len(background)<2:
+                    continue
+                pairs = matcher.knnMatch(descriptors,background,k=2)
+                reused.update(pair[0].queryIdx for pair in pairs if len(pair)==2 and pair[0].distance<250 and pair[0].distance<.7*pair[1].distance)
+            keep = [i for i in range(len(descriptors)) if i not in reused]
+            if len(keep)>=6:
+                self.templates.append(([keypoints[i] for i in keep],descriptors[keep]))
 
     def _match(self,image):
-        self._learn()
-        if self.descriptors is None or len(self.descriptors)<6:
+        self._learn(image.shape)
+        if not self.templates:
             return False
-        points,descriptors=self.sift.detectAndCompute(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),None)
+        points,descriptors = self.sift.detectAndCompute(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),None)
         if descriptors is None or len(descriptors)<2:
             return False
-        matches=cv2.BFMatcher().knnMatch(self.descriptors,descriptors,k=2)
-        good=[pair[0] for pair in matches if len(pair)==2 and pair[0].distance < .7*pair[1].distance]
-        if len(good)<6:
-            return False
-        source=np.float32([self.keypoints[m.queryIdx].pt for m in good])
-        target=np.float32([points[m.trainIdx].pt for m in good])
-        matrix,inliers=cv2.estimateAffinePartial2D(source,target,method=cv2.RANSAC,ransacReprojThreshold=3)
-        if matrix is None or inliers is None or inliers.sum()<6 or inliers.mean()<.6:
-            return False
-        # Localize distributed phone features, not six copies of one tiny ring.
-        valid=source[inliers.ravel().astype(bool)]
-        height,width=image.shape[:2]
-        if np.ptp(valid[:,0]) < width*.08 or np.ptp(valid[:,1]) < height*.08:
-            return False
-        scale=np.hypot(matrix[0,0],matrix[1,0])
-        angle=abs(np.degrees(np.arctan2(matrix[1,0],matrix[0,0])))
-        return .7 < scale < 1.4 and angle<20 and abs(matrix[0,2])<width*.25 and abs(matrix[1,2])<height*.25
+        height,width = image.shape[:2]
+        for keypoints,template in self.templates:
+            matches = cv2.BFMatcher().knnMatch(template,descriptors,k=2)
+            good = [pair[0] for pair in matches if len(pair)==2 and pair[0].distance<.7*pair[1].distance]
+            if len(good)<6:
+                continue
+            source = np.float32([keypoints[m.queryIdx].pt for m in good])
+            target = np.float32([points[m.trainIdx].pt for m in good])
+            matrix,inliers = cv2.estimateAffinePartial2D(source,target,method=cv2.RANSAC,ransacReprojThreshold=3)
+            if matrix is None or inliers is None or inliers.sum()<6 or inliers.mean()<.6:
+                continue
+            valid = source[inliers.ravel().astype(bool)]
+            if np.ptp(valid[:,0])<width*.08 or np.ptp(valid[:,1])<height*.08:
+                continue
+            scale = np.hypot(matrix[0,0],matrix[1,0])
+            angle = abs(np.degrees(np.arctan2(matrix[1,0],matrix[0,0])))
+            if .7<scale<1.4 and angle<20 and abs(matrix[0,2])<width*.25 and abs(matrix[1,2])<height*.25:
+                return True
+        return False
 
     def detect(self,image):
         if np.percentile(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),95)<8:
             return None,'too dark; counting time',[]
         ref_state,ref_label,evidence=_reference_evidence(self.references,image)
         def reconcile(label,polygons):
+            if evidence is not None and evidence.get("ambiguous"):
+                return None,"CONFLICT matching both E/F samples; redo calibration",[]
             if ref_state is False:
                 de,dp=evidence["empty"],evidence["phone"]
                 if de < .02 and dp-de > max(.025,3*de):

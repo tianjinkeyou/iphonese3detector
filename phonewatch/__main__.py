@@ -76,9 +76,10 @@ def main():
         plane_path = args.data_dir / "parking-plane.json"
         plane = None
         plane_checked = False
-        window = "Phone parking monitor - Q: quit / R: area / P: plane / E: empty / F: phone"
+        window = "Phone parking monitor - Q: quit / R: area / P: plane / E: empty / F: phone / C twice: reset refs"
         last_frame = None
         last_log = 0.0
+        clear_deadline = 0.0
         while True:
             ok, frame = capture.read()
             if ok and frame is not None:
@@ -111,6 +112,11 @@ def main():
                 for polygon in polygons:
                     mapped = map_polygon(polygon, inverse) if inverse is not None else polygon + (x, y)
                     cv2.polylines(display, [mapped], True, (0, 255, 0), 2)
+                counts = references.counts
+                sample_label = f"E samples: {counts['empty']} | F samples: {counts['phone']}"
+                if time.monotonic() < clear_deadline:
+                    sample_label = "Press C again to clear all E/F samples"
+                cv2.putText(display,sample_label,(12,height-42),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,0),2)
                 cv2.putText(display, f"{method} | {inference_ms:.0f} ms", (12, height - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                 if plane is not None:
                     cv2.polylines(display, [plane.astype("int32")], True, (255, 180, 0), 2)
@@ -147,11 +153,24 @@ def main():
             key = cv2.waitKey(30) & 0xFF
             if key in (27, ord("q")):
                 break
+            if key == ord("c"):
+                pressed_at = time.monotonic()
+                if pressed_at < clear_deadline:
+                    references.clear()
+                    clear_deadline = 0.0
+                    elapsed, changed = timer.update(None, pressed_at)
+                    store.record(datetime.now(),elapsed,"unknown",changed,timer.interval_state)
+                    print("All E/F reference samples cleared. Recollect E=empty and F=phone.",flush=True)
+                else:
+                    clear_deadline = pressed_at + 3
+                    print("Press C again within 3 seconds to clear all E/F samples.",flush=True)
             if key in (ord("e"), ord("f")) and ok and frame is not None:
                 references.save("empty" if key == ord("e") else "phone", region)
                 elapsed, changed = timer.update(None, time.monotonic())
                 store.record(datetime.now(), elapsed, "unknown", changed, timer.interval_state)
-                print("Reference saved. Keep camera/area fixed. E=empty, F=phone.", flush=True)
+                clear_deadline = 0.0
+                counts = references.counts
+                print(f"Reference added: E={counts['empty']} F={counts['phone']}. E=empty, F=phone.", flush=True)
             if key == ord("p") and ok and frame is not None:
                 elapsed, changed = timer.update(None, time.monotonic())
                 store.record(datetime.now(), elapsed, "unknown", changed, timer.interval_state)

@@ -64,3 +64,26 @@ class ApplicationTests(unittest.TestCase):
             states=[row[0] for row in db.execute('SELECT state FROM events')]
             self.assertEqual(states[-2:],['present','absent'])
             db.close()
+
+    def test_multiple_capture_clear_confirmation_and_data_preservation(self):
+        from phonewatch.reference import ReferenceDetector
+        empty=np.full((160,120,3),160,np.uint8)
+        phone=empty.copy()
+        cv2.rectangle(phone,(25,15),(95,145),(20,20,20),-1)
+        with tempfile.TemporaryDirectory() as tmp:
+            argv=['phonewatch','--detector','reference','--delay','0','--data-dir',tmp]
+            camera=Camera([empty,empty,phone,phone,phone,phone])
+            with patch('sys.argv',argv), patch('cv2.VideoCapture',return_value=camera), patch('cv2.imshow'), patch('cv2.destroyAllWindows'), patch('cv2.waitKey',side_effect=[ord('e'),ord('e'),ord('f'),ord('f'),ord('c'),ord('q')]):
+                main()
+            refs=ReferenceDetector(Path(tmp)/'references')
+            self.assertEqual(refs.counts,{'empty':2,'phone':2})
+            marker=Path(tmp)/'photos'/'keep.txt'
+            marker.write_text('keep this file')
+            camera=Camera([phone,phone,phone])
+            with patch('sys.argv',argv), patch('cv2.VideoCapture',return_value=camera), patch('cv2.imshow'), patch('cv2.destroyAllWindows'), patch('cv2.waitKey',side_effect=[ord('c'),ord('c'),ord('q')]):
+                main()
+            self.assertEqual(ReferenceDetector(Path(tmp)/'references').counts,{'empty':0,'phone':0})
+            self.assertEqual(marker.read_text(),'keep this file')
+            db=sqlite3.connect(Path(tmp)/'usage.sqlite3')
+            self.assertGreater(db.execute('SELECT COUNT(*) FROM events').fetchone()[0],0)
+            db.close()
