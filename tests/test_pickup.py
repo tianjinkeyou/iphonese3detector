@@ -197,6 +197,219 @@ class PickupTrackerTests(unittest.TestCase):
         self.assertEqual(event["kind"], "unobserved_change")
         self.assertEqual(json.loads(json.dumps(event)), event)
 
+    def test_strong_empty_signal_recovers_one_pickup_after_long_unknown(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(None, 2)
+        tracker.update(None, 8)
+        self.assertEqual(tracker.update(False, 10, resolve_gap=True), [])
+        event = tracker.update(False, 11, resolve_gap=True)[0]
+        self.assertEqual(event, {
+            "kind": "pickup", "from_state": "present", "to_state": "absent",
+            "unknown_seconds": 8, "confirmed_after_seconds": 1,
+            "gap_recovered": True, "timing_uncertain": True,
+        })
+        self.assertEqual(tracker.update(False, 12, resolve_gap=True), [])
+        self.assertEqual(tracker.update(False, 30, resolve_gap=True), [])
+        tracker.update(True, 31)
+        returned = tracker.update(True, 32)[0]
+        self.assertEqual(returned["kind"], "return")
+        self.assertEqual(returned["away_seconds"], 21)
+        self.assertEqual(json.loads(json.dumps(event)), event)
+
+    def test_resolve_gap_flag_on_unknown_never_counts_pickup(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        for now in (2, 5, 20, 100):
+            self.assertEqual(tracker.update(None, now, resolve_gap=True), [])
+            self.assertEqual(tracker.state, "unknown")
+        tracker.update(False, 101)
+        event = tracker.update(False, 102)[0]
+        self.assertEqual(event["kind"], "unobserved_change")
+        self.assertNotIn("gap_recovered", event)
+
+    def test_recovered_empty_candidate_must_survive_continuous_confirmation(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(None, 2)
+        tracker.update(False, 10, resolve_gap=True)
+        self.assertEqual(tracker.update(None, 10.5, resolve_gap=True), [])
+        self.assertEqual(tracker.update(False, 11, resolve_gap=True), [])
+        self.assertEqual(tracker.update(False, 11.5, resolve_gap=True), [])
+        event = tracker.update(False, 12, resolve_gap=True)[0]
+        self.assertEqual(event["kind"], "pickup")
+        self.assertEqual(event["unknown_seconds"], 8.5)
+        self.assertEqual(event["confirmed_after_seconds"], 1)
+
+    def test_reset_destroys_gap_even_with_strong_empty_signal(self):
+        for reset_reason in ("camera", "calibration"):
+            with self.subTest(reset_reason=reset_reason):
+                tracker = PickupTracker()
+                self.arm(tracker)
+                tracker.update(None, 2)
+                tracker.update(None, 10)
+                tracker.reset(11)
+                tracker.update(False, 20, resolve_gap=True)
+                event = tracker.update(False, 21, resolve_gap=True)[0]
+                self.assertEqual(event["kind"], "baseline")
+                self.assertNotIn("gap_recovered", event)
+
+    def test_absent_baseline_gap_cannot_create_recovered_pickup(self):
+        tracker = PickupTracker()
+        tracker.update(False, 0)
+        tracker.update(False, 1)
+        tracker.update(None, 2)
+        tracker.update(False, 10, resolve_gap=True)
+        event = tracker.update(False, 11, resolve_gap=True)[0]
+        self.assertEqual(event["kind"], "unobserved_change")
+        self.assertEqual(event["from_state"], "absent")
+        self.assertNotIn("gap_recovered", event)
+        tracker.update(True, 12)
+        self.assertEqual(tracker.update(True, 13), [])
+
+    def test_strong_present_recovery_does_not_fabricate_pickup(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(None, 2)
+        tracker.update(True, 10, resolve_gap=True)
+        event = tracker.update(True, 11, resolve_gap=True)[0]
+        self.assertEqual(event["kind"], "unobserved_change")
+        self.assertEqual(event["to_state"], "present")
+        self.assertNotIn("gap_recovered", event)
+
+    def test_gap_recovery_requires_flag_at_confirmation(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(None, 2)
+        tracker.update(False, 10, resolve_gap=True)
+        event = tracker.update(False, 11)[0]
+        self.assertEqual(event["kind"], "unobserved_change")
+
+    def test_normal_pickup_with_flag_has_no_gap_recovery_fields(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(False, 2, resolve_gap=True)
+        event = tracker.update(False, 3, resolve_gap=True)[0]
+        self.assertEqual(event, {
+            "kind": "pickup", "from_state": "present", "to_state": "absent",
+            "unknown_seconds": 0, "confirmed_after_seconds": 1,
+        })
+
+    def test_resolve_gap_must_be_boolean_and_validation_does_not_advance_time(self):
+        tracker = PickupTracker()
+        tracker.update(True, 0)
+        for invalid_flag in (None, 0, 1, "true", []):
+            with self.subTest(invalid_flag=invalid_flag), self.assertRaises(ValueError):
+                tracker.update(False, 10, resolve_gap=invalid_flag)
+        self.assertEqual(tracker.update(True, 1)[0]["kind"], "baseline")
+
+    def test_one_strong_empty_frame_counts_quick_removal_and_stable_return_once(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        pickup = tracker.update(False, 2, immediate_empty=True)[0]
+        self.assertEqual(pickup["kind"], "pickup")
+        self.assertTrue(pickup["rapid_empty"])
+        self.assertEqual(pickup["confirmed_after_seconds"], 0)
+        self.assertEqual(tracker.state, "absent")
+        # The replacement appears before the usual absence debounce would pass.
+        self.assertEqual(tracker.update(True, 2.1, immediate_empty=True), [])
+        self.assertEqual(tracker.update(True, 2.9), [])
+        returned = tracker.update(True, 3.1)[0]
+        self.assertEqual(returned["kind"], "return")
+        self.assertAlmostEqual(returned["away_seconds"], 1.1)
+        self.assertNotIn("rapid_empty", returned)
+        self.assertEqual(tracker.update(True, 4), [])
+        self.assertEqual(json.loads(json.dumps(pickup)), pickup)
+
+    def test_repeated_strong_empty_frames_and_brief_return_do_not_count_again(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        self.assertEqual(tracker.update(False, 2, immediate_empty=True)[0]["kind"], "pickup")
+        for now in (2.1, 3, 4):
+            self.assertEqual(tracker.update(False, now, immediate_empty=True), [])
+        tracker.update(True, 5)
+        self.assertEqual(tracker.update(False, 5.1, immediate_empty=True), [])
+        tracker.update(True, 6)
+        self.assertEqual(tracker.update(True, 7)[0]["kind"], "return")
+        self.assertEqual(tracker.update(False, 7.1, immediate_empty=True)[0]["kind"], "pickup")
+
+    def test_short_unknown_keeps_present_baseline_for_immediate_empty(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(None, 2)
+        event = tracker.update(False, 2.1, immediate_empty=True)[0]
+        self.assertEqual(event["kind"], "pickup")
+        self.assertTrue(event["rapid_empty"])
+        self.assertAlmostEqual(event["unknown_seconds"], .1)
+        self.assertNotIn("gap_recovered", event)
+
+    def test_long_unknown_requires_gap_resolution_for_immediate_empty(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(None, 2)
+        tracker.update(None, 8)
+        self.assertEqual(tracker.update(False, 10, immediate_empty=True), [])
+        event = tracker.update(False, 10.1, resolve_gap=True, immediate_empty=True)[0]
+        self.assertEqual(event["kind"], "pickup")
+        self.assertTrue(event["rapid_empty"])
+        self.assertTrue(event["gap_recovered"])
+        self.assertTrue(event["timing_uncertain"])
+        self.assertAlmostEqual(event["confirmed_after_seconds"], .1)
+        self.assertEqual(event["unknown_seconds"], 8)
+
+    def test_startup_and_reset_cannot_create_immediate_empty_pickup(self):
+        for after_reset in (False, True):
+            with self.subTest(after_reset=after_reset):
+                tracker = PickupTracker()
+                if after_reset:
+                    self.arm(tracker)
+                    tracker.update(None, 2)
+                    tracker.update(None, 8)
+                    tracker.reset(9)
+                self.assertEqual(tracker.update(False, 10, resolve_gap=True, immediate_empty=True), [])
+                event = tracker.update(False, 11, resolve_gap=True, immediate_empty=True)[0]
+                self.assertEqual(event["kind"], "baseline")
+                self.assertNotIn("rapid_empty", event)
+                self.assertNotIn("gap_recovered", event)
+
+    def test_absent_gap_does_not_become_immediate_pickup(self):
+        tracker = PickupTracker()
+        tracker.update(False, 0)
+        tracker.update(False, 1)
+        tracker.update(None, 2)
+        tracker.update(None, 8)
+        self.assertEqual(tracker.update(False, 10, resolve_gap=True, immediate_empty=True), [])
+        event = tracker.update(False, 11, resolve_gap=True, immediate_empty=True)[0]
+        self.assertEqual(event["kind"], "unobserved_change")
+        self.assertNotIn("rapid_empty", event)
+
+    def test_unknown_and_present_never_use_immediate_empty_bypass(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(None, 2, resolve_gap=True, immediate_empty=True)
+        self.assertEqual(tracker.update(None, 8, resolve_gap=True, immediate_empty=True), [])
+        self.assertEqual(tracker.update(True, 10, resolve_gap=True, immediate_empty=True), [])
+        event = tracker.update(True, 11, resolve_gap=True, immediate_empty=True)[0]
+        self.assertEqual(event["kind"], "unobserved_change")
+        self.assertNotIn("rapid_empty", event)
+
+    def test_normal_debounced_empty_does_not_claim_rapid_confirmation(self):
+        tracker = PickupTracker()
+        self.arm(tracker)
+        tracker.update(False, 2)
+        event = tracker.update(False, 3, immediate_empty=True)[0]
+        self.assertEqual(event["kind"], "pickup")
+        self.assertNotIn("rapid_empty", event)
+        self.assertEqual(event["confirmed_after_seconds"], 1)
+
+    def test_immediate_empty_must_be_boolean_without_advancing_clock(self):
+        tracker = PickupTracker()
+        tracker.update(True, 0)
+        for invalid_flag in (None, 0, 1, "true", []):
+            with self.subTest(invalid_flag=invalid_flag), self.assertRaises(ValueError):
+                tracker.update(False, 10, immediate_empty=invalid_flag)
+        self.assertEqual(tracker.update(True, 1)[0]["kind"], "baseline")
+
     def test_invalid_configuration_and_timestamps_are_rejected(self):
         for value in (-1, float("inf"), float("nan")):
             for option in ("delay", "unknown_gap"):

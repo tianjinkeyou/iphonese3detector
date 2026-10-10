@@ -133,15 +133,19 @@ python -m phonewatch --camera /dev/video2 --detector reference --delay 5
 
 ## 拿起次数与 AI 分析用事件文本
 
-新版在 `auto`、`smart`、`reference`、`yolo`、`smart-watch` 模式中都自动统计拿起次数，无需额外开启。画面显示 `PICKUPS today`，按天保存、重启保留。原有启动命令可继续使用。
+新版在 `auto`、`smart`、`reference`、`yolo`、`smart-watch` 模式中都自动统计拿起次数，无需额外开启。默认 `--pickup-mode parking` 独立比较 E 空支架与 F 停放手机的机身证据，判断手机是否仍在原停放位置；R 中其他位置检测到手机，不直接算作已经放回。有可靠空位证据时，手机离开支架但仍在摄像头画面中，也能记录拿起。E/F 缺失、与当前区域不兼容，或无法从 E/F 区分机身和空支架时，回退原手机检测依据；`--pickup-mode presence` 可显式使用原方式。若画面显示回退手机检测的依据，建议用 R 包含机身边框及附近背景，再分别保存手已离开的 E/F。
 
-一次拿起是**摄像头观察到的稳定 PRESENT → ABSENT 变化**：先确认手机在停放区，再确认离开，才加一次；持续离开不会重复加次数，确认放回后才能开始下一次。拿起/放回使用独立的 `--pickup-delay`，默认 1 秒；原有离开时间的 `--delay` 仍默认 5 秒。因此较短的拿走也可能记录一次，而离开计时状态尚未切换。低帧率下，发生在两帧之间的拿走/放回仍可能漏记。
+画面显示 `PICKUPS today`，按天保存、重启保留；`Pickup evidence` 另显示 `PARKED`、`EMPTY` 或 `UNCERTAIN` 及判断方式，与原有 PRESENT/ABSENT/UNKNOWN 计时状态分开。一次拿起是**确认 PARKED → 确认 EMPTY 的变化**：先确认手机停放，再确认空位，才加一次；持续空位不会重复加次数，确认放回后才能开始下一次。拿起/放回使用独立的 `--pickup-delay`，默认 1 秒；原有离开时间的 `--delay` 仍默认 5 秒，算法和计时规则保留。因此较短的拿走也可能记录一次，而离开计时状态尚未切换。
 
-短暂 UNKNOWN（最多 2 秒）允许桥接前后的确认状态，但 UNKNOWN 不计入拿起/放回的确认时间，并会在事件中保留 `unknown_seconds`，供分析时识别证据缺口。较长 UNKNOWN、摄像头断连、程序重启或校准操作会重新建立基线，不推测缺失画面中的拿起次数。启动时手机已不在区域内，不算一次拿起；旧版记录也不会追溯生成次数。
+默认 parking 模式还支持快速拿起：已经确认 PARKED 后，只要至少一帧处理画面严格匹配高置信空支架 E，就立即记录一次拿起并保存照片，事件带 `rapid_empty: true`；单帧立即确认时 `confirmed_after_seconds` 为 0。普通空位、回退检测和放回仍使用 `--pickup-delay`，启动空位或摄像头恢复不会凭一帧建立拿起记录。快速换手机时如果拍到这种空位帧，也可以记一次；整个动作发生在两帧之间、被手遮住或没有可靠空位证据时，仍无法可靠计数。相同或相似手机的身份不能靠这一条事件确定。
+
+短暂 UNKNOWN（最多 2 秒）允许桥接前后的确认状态，但 UNKNOWN 不计入拿起/放回的确认时间，并会在事件中保留 `unknown_seconds`。较长 UNKNOWN 后，只有摄像头始终有效、此前确认过 PARKED、随后确认符合补证据条件的高置信空位时，才能补记一次估算拿起；事件标记 `gap_recovered: true`、`timing_uncertain: true`，保留未知时长。它不能确定拿起的准确时间，也不能还原未知期间发生了几次拿起/放回；这种事件的 `away_seconds` 从恢复后确认空位时开始，不计入未知间隔。UNKNOWN 本身或弱空位证据不会增加次数。
+
+摄像头断连、程序重启或校准操作仍会重新建立基线，不补记期间的拿起次数。启动时手机已不在区域内，不算一次拿起；旧版记录也不会追溯生成次数。原有启动命令可继续使用。
 
 每次确认拿起、以及该次拿起后确认放回时，触发原始全画面快照，保存在 `data/photos/pickup_*.jpg`、`return_*.jpg`。事件中的 `photo_path` 相对于 `--data-dir`，例如 `photos/pickup_example.jpg`。照片保存失败时保留 `photo_path: null` 和 `photo_error`，已确认的拿起次数仍会保存。拿起次数和事件以同一个 `data/usage.sqlite3` 数据库的 `activity_events` 表为准，不依赖文本行数统计。放回事件的 `away_seconds` 表示从确认拿起到确认放回的间隔，可能包含短暂 UNKNOWN；它不等于已确认的使用时间或 ABSENT 计时。
 
-拿起时还保存最近一次确认 PRESENT 的原始画面 `before_pickup_*.jpg`；事件中的 `before_photo_path` 指向它，`before_photo_time` 保留原画面的采集时间。对应的拿起与放回事件共享 `cycle_id`，便于比较拿走前和放回后的手机外观。长 UNKNOWN 恢复时记录 `unobserved_change` 和恢复后的照片；若此前有确认 PRESENT 的画面，也保存 `before_unobserved_change_*.jpg` 供前后核查，但不增加拿起次数。这些照片可以辅助发现外观变化，仍不能证明手机身份。
+拿起时还保存最近一次确认停放的原始画面 `before_pickup_*.jpg`；事件中的 `before_photo_path` 指向它，`before_photo_time` 保留原画面的采集时间。对应的拿起与放回事件共享 `cycle_id`，便于比较拿走前和放回后的手机外观。未能补证据的长 UNKNOWN 恢复时，记录 `unobserved_change` 和恢复后的照片；若此前有确认停放的画面，也保存 `before_unobserved_change_*.jpg` 供前后核查，事件本身不增加拿起次数。这些照片可以辅助发现外观变化，仍不能证明手机身份。
 
 事件文本自动写入 `data/events/YYYY-MM-DD.txt`，使用 UTF-8：文件开头说明字段，之后每行是一条 JSON 事件，便于直接交给 AI 分析。每次运行保留独立的 `session` 标识；记录手机状态变化、拿起/放回、摄像头异常及恢复、E/F 样本和区域校准操作，以及启用 `smart-watch` 后的疑似使用开始/结束。约每 5 分钟、以及程序正常退出时，写入一次 `summary`，包含当天拿起次数、离开秒数、不确定秒数、疑似使用秒数和本次运行时间。重启追加新记录，不覆盖旧记录。文本导出失败时，SQLite 中的事件仍然保留，终端会打印诊断；后续成功导出时会恢复文本记录。
 
@@ -158,7 +162,7 @@ python -m phonewatch --camera /dev/video2 --detector reference --delay 5
 需要更敏感时，可使用 `--pickup-delay 0.5`；短暂遮挡和漏检也更容易变成拿起记录。建议先在本地验证：
 
 1. 手机放好并等待确认，拿走超过 1 秒，再放回等待确认；次数应增加 1，TXT 应出现 `pickup` 和 `return`，并有两张事件照片。
-2. 手机拿走后再启动程序；应显示 ABSENT，但不能凭启动状态增加拿起次数。
+2. 手机离开支架但仍放在摄像头画面其他位置；有正确 E/F 和可靠空位证据时，`Pickup evidence` 应变为 EMPTY，次数增加 1，不要求原有计时状态一定变为 ABSENT。手机拿走后再启动程序，不能凭启动状态增加拿起次数。
 3. 手机放好后断开摄像头、拿走手机，再恢复摄像头；应记录摄像头异常和 UNKNOWN，不能推测断连期间的拿起次数。再次正常放回、拿走后，才记录新的一次。
 
 ## 智能检测与 E 空支架冲突的处理

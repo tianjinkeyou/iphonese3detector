@@ -27,7 +27,8 @@ def parse_args():
     parser.add_argument("--screen-threshold", type=float, default=0.025, help="minimum changed screen fraction, e.g. 0.025 = 2.5%%")
     parser.add_argument("--watch-delay", type=float, default=3.0, help="continuous hand proximity or screen activity seconds before suspected use")
     parser.add_argument("--delay", type=float, default=5.0)
-    parser.add_argument("--pickup-delay", type=float, default=1.0, help="continuous absence/presence seconds before pickup/return; independent of --delay")
+    parser.add_argument("--pickup-delay", type=float, default=1.0, help="normal empty/return confirmation seconds; strict parking-empty frames can count immediately; independent of --delay")
+    parser.add_argument("--pickup-mode", choices=("parking", "presence"), default="parking", help="parking: use E/F parked-body evidence; presence: legacy region-presence transitions")
     parser.add_argument("--photo-interval", type=float, default=120.0)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--ignore-plane", action="store_true", help="ignore saved perspective calibration for this run")
@@ -56,6 +57,7 @@ def main():
     from .reference import ReferenceDetector
     from .detection import PhoneDetector
     from .perspective import load_plane, save_plane, select_plane, rectify, map_polygon
+    from .parking import ParkingDetector
 
     camera = int(args.camera) if args.camera.isdecimal() else args.camera
     capture = cv2.VideoCapture(camera)
@@ -76,6 +78,7 @@ def main():
         if not capture.isOpened():
             raise RuntimeError("Cannot open camera. Check --camera and Ubuntu camera permissions.")
         references = ReferenceDetector(args.data_dir / "references")
+        parking_detector = ParkingDetector(references)
         detector = None
         def make_detector():
             from ultralytics import YOLO
@@ -177,6 +180,7 @@ def main():
         summary_day = datetime.now().date().isoformat()
         record_event("session_start",camera=args.camera,detector=args.detector,
                      detection_mode=args.detection_mode,delay=args.delay,pickup_delay=args.pickup_delay,
+                     pickup_mode=args.pickup_mode,
                      pickup_unknown_gap=pickups.unknown_gap,watch_delay=args.watch_delay,
                      watch_screen=args.watch_screen,screen_threshold=args.screen_threshold,
                      hand_mode=args.hand_mode,photo_interval=args.photo_interval,
@@ -184,6 +188,11 @@ def main():
                      references=references.counts)
         while True:
             ok, frame = capture.read()
+            pickup_observation = None
+            pickup_source = "camera_unavailable"
+            pickup_method = "camera unavailable"
+            pickup_evidence = {}
+            screen_in_region = None
             if ok and frame is not None:
                 height, width = frame.shape[:2]
                 if roi_size is not None and roi_size != [height,width]:
@@ -204,14 +213,15 @@ def main():
                     except (ValueError, KeyError, TypeError) as exc:
                         print(f"Screen calibration needs S again: {exc}",flush=True)
                     screen_checked = True
+                if screen_polygon is not None:
+                    import numpy as np
+                    screen_in_region = (cv2.perspectiveTransform(np.float32([screen_polygon]),np.linalg.inv(inverse))[0]
+                                        if inverse is not None else screen_polygon-(x,y))
                 started = time.monotonic()
                 polygons = []
                 if args.detector in ("auto", "smart", "smart-watch"):
                     present, method, polygons = smart.detect(region)
                     if present is None and screen_detector is not None and screen_polygon is not None:
-                        import numpy as np
-                        screen_in_region = (cv2.perspectiveTransform(np.float32([screen_polygon]),np.linalg.inv(inverse))[0]
-                                            if inverse is not None else screen_polygon-(x,y))
                         body_present, body_label = screen_body_presence(
                             region,screen_in_region,references.compatible("empty",region.shape),references.compatible("phone",region.shape))
                         if body_present is not None:
@@ -223,6 +233,14 @@ def main():
                         detector = make_detector()
                     polygons, method = detector.detect(region)
                     present = bool(polygons)
+                if args.pickup_mode == "parking" and parking_detector.ready(region.shape,screen_polygon=screen_in_region):
+                    pickup_observation,pickup_method,pickup_evidence = parking_detector.detect(
+                        region,phone_polygons=polygons,screen_polygon=screen_in_region)
+                    pickup_source = "parking"
+                else:
+                    pickup_observation = present
+                    pickup_source = "phone_presence"
+                    pickup_method = method if args.pickup_mode=="presence" else "E/F parking unavailable; presence fallback"
                 inference_ms = (time.monotonic() - started) * 1000
                 display = frame.copy()
                 for polygon in polygons:
@@ -258,10 +276,14 @@ def main():
                 camera_available = available
             elapsed, changed = update_usage(present,now,at)
             if available:
-                for event in pickups.update(present,now):
+                resolve_gap = pickup_source=="parking" and pickup_observation is False and pickup_evidence.get("reliable_empty") is True
+                immediate_empty = resolve_gap and pickup_evidence.get("immediate_empty") is True
+                for event in pickups.update(pickup_observation,now,resolve_gap=resolve_gap,immediate_empty=immediate_empty):
                     details = dict(event)
                     kind = details.pop("kind")
-                    details.update(method=method,state=timer.state)
+                    details.update(method=pickup_method,state=timer.state,pickup_source=pickup_source,
+                                   phone_method=method,phone_observation="unknown" if present is None else "present" if present else "absent",
+                                   parking_evidence=pickup_evidence)
                     if kind == "pickup":
                         pickup_cycle += 1
                         pickup_cycle_id = f"{journal.session_id}:{pickup_cycle}"
@@ -282,7 +304,7 @@ def main():
                     record_event(kind,at,**details)
                     if kind in ("return","unobserved_change","baseline"):
                         pickup_cycle_id = None
-                if present is True and pickups.state=="present":
+                if pickup_observation is True and pickups.state=="present":
                     last_present_frame = frame.copy()
                     last_present_at = at
             else:
@@ -419,6 +441,10 @@ def main():
                 cv2.putText(display, f"ABSENT today: {totals['absent']/60:.1f} min", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, STATE_COLORS["absent"], 2)
                 cv2.putText(display, f"UNKNOWN / UNCERTAIN: {totals['unknown']/60:.1f} min", (12, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, STATE_COLORS["unknown"], 2)
                 cv2.putText(display,f"PICKUPS today (estimated): {pickup_total}",(12,120),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+                parking_state = "unknown" if pickup_observation is None else "present" if pickup_observation else "absent"
+                parking_word = "PARKED" if pickup_observation is True else "EMPTY" if pickup_observation is False else "UNCERTAIN"
+                cv2.putText(display,f"Pickup evidence: {parking_word} ({pickup_source})",(12,335),cv2.FONT_HERSHEY_SIMPLEX,0.5,STATE_COLORS[parking_state],1)
+                cv2.putText(display,pickup_method,(12,355),cv2.FONT_HERSHEY_SIMPLEX,0.45,STATE_COLORS[parking_state],1)
                 if totals['legacy']:
                     cv2.putText(display, f"Legacy unsplit: {totals['legacy']/60:.1f} min", (12, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
                 if watch_timer is not None:

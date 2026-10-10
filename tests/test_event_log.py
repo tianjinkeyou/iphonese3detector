@@ -35,6 +35,11 @@ class EventJournalTests(unittest.TestCase):
         self.assertIn("当日拿起次数（估计）：1", content)
         self.assertIn("未推算旧历史", content)
         self.assertIn("摄像头中断期间", content)
+        self.assertIn("只有 unknown 不会计次", content)
+        self.assertIn("rapid_empty=true", content)
+        self.assertIn("全程遮挡，无法可靠计次", content)
+        self.assertIn("gap_recovered=true、timing_uncertain=true", content)
+        self.assertIn("不含之前的 unknown 间隙", content)
         self.assertIn("手机离开\\n支架", content)
         self.assertEqual(event_lines(path), [{
             "id": event_id, "time": self.at.isoformat(), "event": "pickup",

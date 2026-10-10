@@ -14,7 +14,12 @@ class PickupTracker:
 
     ``update`` returns event dictionaries for a journal to timestamp and count.
     A pickup requires a previously confirmed PRESENT baseline. Startup ABSENT
-    and recovery after a long uncertain interval never count as a pickup.
+    never counts as a pickup. A caller may immediately confirm a disappearance
+    using a strong independent empty-area observation, so a short removal does
+    not have to last for the normal debounce delay. After a long uncertain
+    interval, a caller may
+    explicitly resolve that baseline using a strongly confirmed empty parking
+    area; the resulting pickup carries flags indicating uncertain timing.
     Short UNKNOWN intervals interrupt confirmation but may bridge a baseline;
     their total duration before the next stable observation is reported.
     """
@@ -48,17 +53,38 @@ class PickupTracker:
             self._stable = None
             self._pickup_at = None
 
-    def update(self, present: bool | None, now: float) -> list[dict]:
+    def update(
+        self,
+        present: bool | None,
+        now: float,
+        *,
+        resolve_gap: bool = False,
+        immediate_empty: bool = False,
+    ) -> list[dict]:
         """Return stable transition events using finite monotonic seconds.
 
         Return ``away_seconds`` spans the confirmed pickup and confirmed return,
         rather than attributing any pre-confirmation interval as observed usage.
         ``confirmed_after_seconds`` records the actual confirmation delay; at a
         slow frame rate it can be greater than the configured minimum delay.
+        ``resolve_gap`` is only for an independent, reliable empty-area signal.
+        A recovered pickup establishes that at least one removal occurred; it
+        cannot establish when it occurred or how many removals happened in the
+        gap. UNKNOWN itself never produces a pickup, even with this flag.
+        ``immediate_empty`` may bypass only an existing PRESENT baseline's
+        absence delay, using an independently verified empty-area frame. It
+        cannot bypass baseline or return confirmation. A long gap additionally
+        requires ``resolve_gap``. Events that use this bypass carry
+        ``rapid_empty=True``; absence shorter than one captured frame remains
+        unobservable.
         """
         self._validate_time(now)
         if present is not None and not isinstance(present, bool):
             raise ValueError("presence must be True, False, or None")
+        if not isinstance(resolve_gap, bool):
+            raise ValueError("resolve_gap must be a boolean")
+        if not isinstance(immediate_empty, bool):
+            raise ValueError("immediate_empty must be a boolean")
         self._previous = now
 
         if present is None:
@@ -88,7 +114,16 @@ class PickupTracker:
             self._candidate = target
             self._candidate_since = now
         confirmed_after = now - self._candidate_since
-        if confirmed_after < self.delay:
+        rapid_empty = (
+            target == "absent"
+            and immediate_empty
+            and confirmed_after < self.delay
+            and (
+                self._stable == "present"
+                or (resolve_gap and self._gap_from == "present")
+            )
+        )
+        if confirmed_after < self.delay and not rapid_empty:
             return []
 
         before = self._stable
@@ -98,13 +133,23 @@ class PickupTracker:
             "unknown_seconds": self._unknown_seconds,
             "confirmed_after_seconds": confirmed_after,
         }
+        if rapid_empty:
+            event["rapid_empty"] = True
         self.state = self._stable = target
         self._candidate = None
         self._candidate_since = None
         self._unknown_seconds = 0.0
 
         if self._gap_from is not None:
-            event["kind"] = "unobserved_change"
+            if resolve_gap and target == "absent" and self._gap_from == "present":
+                event["kind"] = "pickup"
+                event["gap_recovered"] = True
+                event["timing_uncertain"] = True
+                # Start subsequent away time only once the area is known to be
+                # empty. Do not invent the pickup's time inside the gap.
+                self._pickup_at = now
+            else:
+                event["kind"] = "unobserved_change"
             self._gap_from = None
             return [event]
         if before is None:
