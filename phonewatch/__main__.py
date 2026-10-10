@@ -13,7 +13,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Local phone parking monitor. Esc/Q exits; R selects area; P calibrates tilted phone plane.")
     parser.add_argument("--camera", default="0", help="camera index or /dev/video path")
     parser.add_argument("--model", default="yolo11n.pt", help="Ultralytics model path (first run downloads weights)")
-    parser.add_argument("--detector", choices=("auto", "home", "reference", "yolo"), default="auto", help="auto prefers H button features, then E/F references; home/reference avoid model downloads")
+    parser.add_argument("--detector", choices=("auto", "smart", "reference", "yolo"), default="auto", help="auto/smart: YOLO, moving features, then R/E/F fallback; reference: old R/E/F only")
     parser.add_argument("--detection-mode", choices=("robust", "fast"), default="robust", help="robust: rotation/low-light fallback; fast: single view")
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--delay", type=float, default=5.0)
@@ -37,7 +37,7 @@ def main():
     config_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir.resolve()))
     import cv2
-    from .home import HomeDetector
+    from .smart import SmartDetector
     from .reference import ReferenceDetector
     from .detection import PhoneDetector
     from .perspective import load_plane, save_plane, select_plane, rectify, map_polygon
@@ -49,24 +49,39 @@ def main():
         if not capture.isOpened():
             raise RuntimeError("Cannot open camera. Check --camera and Ubuntu camera permissions.")
         references = ReferenceDetector(args.data_dir / "references")
-        home = HomeDetector(args.data_dir / "home")
         detector = None
+        def make_detector():
+            from ultralytics import YOLO
+            model = YOLO(args.model)
+            classes=[i for i,label in model.names.items() if label == "cell phone"]
+            if not classes:
+                raise RuntimeError("Model has no cell phone class")
+            return PhoneDetector(model,classes,args.confidence,args.detection_mode)
+        smart = SmartDetector(references,make_detector)
         store = Store(args.data_dir)
         photos = args.data_dir / "photos"
         photos.mkdir(exist_ok=True)
         timer = UsageTimer(args.delay)
+        roi_path=args.data_dir / "parking-area.json"
         roi = tuple(args.roi) if args.roi else None
+        if roi is None and roi_path.exists():
+            import json
+            saved=json.loads(roi_path.read_text())
+            roi=tuple(saved["roi"])
+        roi_size=None if args.roi or not roi_path.exists() else saved["size"]
         next_photo = time.monotonic() + args.photo_interval
         plane_path = args.data_dir / "parking-plane.json"
         plane = None
         plane_checked = False
-        window = "Phone parking monitor - Q: quit / R: area / P: plane / E: empty / F: phone / H: Home button"
+        window = "Phone parking monitor - Q: quit / R: area / P: plane / E: empty / F: phone"
         last_frame = None
         last_log = 0.0
         while True:
             ok, frame = capture.read()
             if ok and frame is not None:
                 height, width = frame.shape[:2]
+                if roi_size is not None and roi_size != [height,width]:
+                    raise RuntimeError("Camera size changed. Use --roi to override saved area and recalibrate R/E/F.")
                 x, y, w, h = roi or (0, 0, width, height)
                 if x + w > width or y + h > height:
                     raise RuntimeError("ROI exceeds camera image. Select a smaller area.")
@@ -79,18 +94,13 @@ def main():
                     region, inverse = rectify(frame, plane)
                 started = time.monotonic()
                 polygons = []
-                if args.detector == "home" or (args.detector == "auto" and home.ready):
-                    present, method = home.detect(frame)
-                elif args.detector == "reference" or (args.detector == "auto" and references.ready):
+                if args.detector in ("auto", "smart"):
+                    present, method, polygons = smart.detect(region)
+                elif args.detector == "reference":
                     present, method = references.detect(region)
                 else:
                     if detector is None:
-                        from ultralytics import YOLO
-                        model = YOLO(args.model)
-                        phone_classes = [i for i, label in model.names.items() if label == "cell phone"]
-                        if not phone_classes:
-                            raise RuntimeError("Model has no cell phone class")
-                        detector = PhoneDetector(model, phone_classes, args.confidence, args.detection_mode)
+                        detector = make_detector()
                     polygons, method = detector.detect(region)
                     present = bool(polygons)
                 inference_ms = (time.monotonic() - started) * 1000
@@ -99,9 +109,6 @@ def main():
                     mapped = map_polygon(polygon, inverse) if inverse is not None else polygon + (x, y)
                     cv2.polylines(display, [mapped], True, (0, 255, 0), 2)
                 cv2.putText(display, f"{method} | {inference_ms:.0f} ms", (12, height - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                if home.ready and args.detector in ("auto", "home"):
-                    hx,hy,hw,hh = home.box
-                    cv2.rectangle(display,(hx,hy),(hx+hw,hy+hh),(255,0,255),2)
                 if plane is not None:
                     cv2.polylines(display, [plane.astype("int32")], True, (255, 180, 0), 2)
                 else:
@@ -135,21 +142,9 @@ def main():
                 break
             if key in (ord("e"), ord("f")) and ok and frame is not None:
                 references.save("empty" if key == ord("e") else "phone", region)
-                if key == ord("e"):
-                    home.save_empty(frame)
                 timer.update(None, time.monotonic())
                 store.record(datetime.now(), 0, "unknown", True)
                 print("Reference saved. Keep camera/area fixed. E=empty, F=phone.", flush=True)
-            if key == ord("h") and ok and frame is not None:
-                timer.update(None, time.monotonic())
-                store.record(datetime.now(),0,"unknown",True)
-                selected = cv2.selectROI(window,frame,showCrosshair=True,fromCenter=False)
-                if selected[2] and selected[3]:
-                    try:
-                        home.save_button(frame,selected)
-                        print("Home feature saved. Remove phone, leave view, press E to save empty stand.",flush=True)
-                    except ValueError as exc:
-                        print(f"Home calibration rejected: {exc}",flush=True)
             if key == ord("p") and ok and frame is not None:
                 timer.update(None, time.monotonic())
                 store.record(datetime.now(), 0, "unknown", True)
@@ -157,6 +152,9 @@ def main():
                 if selected is not None:
                     save_plane(plane_path, selected, frame.shape)
                     plane = selected
+                    roi = None
+                    roi_size = None
+                    roi_path.unlink(missing_ok=True)
                     references.clear()
                     print("Saved tilted phone plane. Recalibrate if camera or stand moves.", flush=True)
             if key == ord("r") and ok and frame is not None:
@@ -166,6 +164,9 @@ def main():
                 selected = cv2.selectROI(window, frame, showCrosshair=True, fromCenter=False)
                 if selected[2] and selected[3]:
                     roi = selected
+                    roi_size=[height,width]
+                    import json
+                    roi_path.write_text(json.dumps({"roi":list(roi),"size":roi_size}))
                     plane = None
                     references.clear()
                     plane_path.unlink(missing_ok=True)

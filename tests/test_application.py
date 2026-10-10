@@ -42,21 +42,25 @@ class ApplicationTests(unittest.TestCase):
             self.assertGreater(db.execute('SELECT SUM(seconds) FROM daily').fetchone()[0],0)
             db.close()
 
-    def test_home_calibration_and_uncertainty_in_camera_loop(self):
-        empty=np.full((180,240,3),120,np.uint8)
+    def test_smart_fallback_roi_persists_across_restart(self):
+        from phonewatch.smart import SmartDetector
+        class Miss:
+            def detect(self,image):
+                return [],'miss'
+        factory=lambda refs,model_factory: SmartDetector(refs,Miss)
+        empty=np.full((160,120,3),160,np.uint8)
         phone=empty.copy()
-        cv2.rectangle(phone,(60,20),(180,160),(12,12,12),-1)
-        cv2.ellipse(phone,(120,140),(13,8),-10,0,360,(90,90,90),2)
-        camera=Camera([phone,empty,phone,np.zeros_like(phone),empty])
+        cv2.rectangle(phone,(25,15),(95,145),(20,20,20),-1)
         with tempfile.TemporaryDirectory() as tmp:
-            argv=['phonewatch','--detector','home','--delay','0','--photo-interval','1','--data-dir',tmp]
-            with patch('sys.argv',argv), patch('cv2.VideoCapture',return_value=camera), patch('cv2.imshow'), patch('cv2.destroyAllWindows'), patch('cv2.selectROI',return_value=(100,126,40,28)), patch('cv2.waitKey',side_effect=[ord('h'),ord('e'),-1,-1,ord('q')]), patch('phonewatch.__main__.time.monotonic',side_effect=itertools.count(0,1)):
+            argv=['phonewatch','--detector','smart','--delay','0','--data-dir',tmp]
+            camera=Camera([empty,empty,phone,phone,empty])
+            with patch('sys.argv',argv), patch('cv2.VideoCapture',return_value=camera), patch('cv2.imshow'), patch('cv2.destroyAllWindows'), patch('cv2.selectROI',return_value=(10,10,100,140)), patch('cv2.waitKey',side_effect=[ord('r'),ord('e'),ord('f'),-1,ord('q')]), patch('phonewatch.smart.SmartDetector',side_effect=factory):
                 main()
-            self.assertTrue(camera.released)
-            self.assertTrue((Path(tmp)/'home'/'button.png').exists())
+            self.assertTrue((Path(tmp)/'parking-area.json').exists())
+            camera=Camera([phone,empty])
+            with patch('sys.argv',argv), patch('cv2.VideoCapture',return_value=camera), patch('cv2.imshow'), patch('cv2.destroyAllWindows'), patch('cv2.waitKey',side_effect=[-1,ord('q')]), patch('phonewatch.smart.SmartDetector',side_effect=factory):
+                main()
             db=sqlite3.connect(Path(tmp)/'usage.sqlite3')
             states=[row[0] for row in db.execute('SELECT state FROM events')]
-            self.assertEqual(states[-3:],['present','unknown','absent'])
-            # The dark frame must not create any usage interval.
-            self.assertIsNone(db.execute('SELECT SUM(seconds) FROM daily').fetchone()[0])
+            self.assertEqual(states[-2:],['present','absent'])
             db.close()
