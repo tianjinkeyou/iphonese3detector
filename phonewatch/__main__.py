@@ -13,7 +13,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Local phone parking monitor. Esc/Q exits; R selects area; P calibrates tilted phone plane.")
     parser.add_argument("--camera", default="0", help="camera index or /dev/video path")
     parser.add_argument("--model", default="yolo11n.pt", help="Ultralytics model path (first run downloads weights)")
-    parser.add_argument("--detector", choices=("auto", "reference", "yolo"), default="auto", help="auto uses E/F references when calibrated; reference avoids model download")
+    parser.add_argument("--detector", choices=("auto", "home", "reference", "yolo"), default="auto", help="auto prefers H button features, then E/F references; home/reference avoid model downloads")
     parser.add_argument("--detection-mode", choices=("robust", "fast"), default="robust", help="robust: rotation/low-light fallback; fast: single view")
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--delay", type=float, default=5.0)
@@ -37,6 +37,7 @@ def main():
     config_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir.resolve()))
     import cv2
+    from .home import HomeDetector
     from .reference import ReferenceDetector
     from .detection import PhoneDetector
     from .perspective import load_plane, save_plane, select_plane, rectify, map_polygon
@@ -48,6 +49,7 @@ def main():
         if not capture.isOpened():
             raise RuntimeError("Cannot open camera. Check --camera and Ubuntu camera permissions.")
         references = ReferenceDetector(args.data_dir / "references")
+        home = HomeDetector(args.data_dir / "home")
         detector = None
         store = Store(args.data_dir)
         photos = args.data_dir / "photos"
@@ -58,7 +60,7 @@ def main():
         plane_path = args.data_dir / "parking-plane.json"
         plane = None
         plane_checked = False
-        window = "Phone parking monitor - Q: quit / R: area / P: plane / E: empty / F: phone"
+        window = "Phone parking monitor - Q: quit / R: area / P: plane / E: empty / F: phone / H: Home button"
         last_frame = None
         last_log = 0.0
         while True:
@@ -77,7 +79,9 @@ def main():
                     region, inverse = rectify(frame, plane)
                 started = time.monotonic()
                 polygons = []
-                if args.detector == "reference" or (args.detector == "auto" and references.ready):
+                if args.detector == "home" or (args.detector == "auto" and home.ready):
+                    present, method = home.detect(frame)
+                elif args.detector == "reference" or (args.detector == "auto" and references.ready):
                     present, method = references.detect(region)
                 else:
                     if detector is None:
@@ -95,6 +99,9 @@ def main():
                     mapped = map_polygon(polygon, inverse) if inverse is not None else polygon + (x, y)
                     cv2.polylines(display, [mapped], True, (0, 255, 0), 2)
                 cv2.putText(display, f"{method} | {inference_ms:.0f} ms", (12, height - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                if home.ready and args.detector in ("auto", "home"):
+                    hx,hy,hw,hh = home.box
+                    cv2.rectangle(display,(hx,hy),(hx+hw,hy+hh),(255,0,255),2)
                 if plane is not None:
                     cv2.polylines(display, [plane.astype("int32")], True, (255, 180, 0), 2)
                 else:
@@ -128,9 +135,21 @@ def main():
                 break
             if key in (ord("e"), ord("f")) and ok and frame is not None:
                 references.save("empty" if key == ord("e") else "phone", region)
+                if key == ord("e"):
+                    home.save_empty(frame)
                 timer.update(None, time.monotonic())
                 store.record(datetime.now(), 0, "unknown", True)
                 print("Reference saved. Keep camera/area fixed. E=empty, F=phone.", flush=True)
+            if key == ord("h") and ok and frame is not None:
+                timer.update(None, time.monotonic())
+                store.record(datetime.now(),0,"unknown",True)
+                selected = cv2.selectROI(window,frame,showCrosshair=True,fromCenter=False)
+                if selected[2] and selected[3]:
+                    try:
+                        home.save_button(frame,selected)
+                        print("Home feature saved. Remove phone, leave view, press E to save empty stand.",flush=True)
+                    except ValueError as exc:
+                        print(f"Home calibration rejected: {exc}",flush=True)
             if key == ord("p") and ok and frame is not None:
                 timer.update(None, time.monotonic())
                 store.record(datetime.now(), 0, "unknown", True)

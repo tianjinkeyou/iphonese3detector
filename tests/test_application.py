@@ -41,3 +41,22 @@ class ApplicationTests(unittest.TestCase):
             self.assertIn('absent',states)
             self.assertGreater(db.execute('SELECT SUM(seconds) FROM daily').fetchone()[0],0)
             db.close()
+
+    def test_home_calibration_and_uncertainty_in_camera_loop(self):
+        empty=np.full((180,240,3),120,np.uint8)
+        phone=empty.copy()
+        cv2.rectangle(phone,(60,20),(180,160),(12,12,12),-1)
+        cv2.ellipse(phone,(120,140),(13,8),-10,0,360,(90,90,90),2)
+        camera=Camera([phone,empty,phone,np.zeros_like(phone),empty])
+        with tempfile.TemporaryDirectory() as tmp:
+            argv=['phonewatch','--detector','home','--delay','0','--photo-interval','1','--data-dir',tmp]
+            with patch('sys.argv',argv), patch('cv2.VideoCapture',return_value=camera), patch('cv2.imshow'), patch('cv2.destroyAllWindows'), patch('cv2.selectROI',return_value=(100,126,40,28)), patch('cv2.waitKey',side_effect=[ord('h'),ord('e'),-1,-1,ord('q')]), patch('phonewatch.__main__.time.monotonic',side_effect=itertools.count(0,1)):
+                main()
+            self.assertTrue(camera.released)
+            self.assertTrue((Path(tmp)/'home'/'button.png').exists())
+            db=sqlite3.connect(Path(tmp)/'usage.sqlite3')
+            states=[row[0] for row in db.execute('SELECT state FROM events')]
+            self.assertEqual(states[-3:],['present','unknown','absent'])
+            # The dark frame must not create any usage interval.
+            self.assertIsNone(db.execute('SELECT SUM(seconds) FROM daily').fetchone()[0])
+            db.close()
