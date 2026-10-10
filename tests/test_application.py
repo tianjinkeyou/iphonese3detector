@@ -39,7 +39,7 @@ class ApplicationTests(unittest.TestCase):
             states=[row[0] for row in db.execute('SELECT state FROM events')]
             self.assertIn('present',states)
             self.assertIn('absent',states)
-            self.assertGreater(db.execute('SELECT SUM(seconds) FROM daily').fetchone()[0],0)
+            self.assertGreater(db.execute('SELECT SUM(seconds) FROM daily_state').fetchone()[0],0)
             db.close()
 
     def test_smart_fallback_roi_persists_across_restart(self):

@@ -10,11 +10,13 @@ class UsageTimer:
     candidate: str | None = None
     candidate_since: float = 0.0
     previous: float | None = None
+    interval_state: str | None = None
 
     def update(self, present: bool | None, now: float) -> tuple[float, bool]:
         if self.previous is not None and now < self.previous:
             raise ValueError("timestamps must be monotonic")
         elapsed = 0.0
+        self.interval_state = self.state if self.state in ("absent", "unknown") else None
         # Charge the interval according to the previous displayed state.
         # A new observation takes effect at now, without retroactive charging.
         if self.previous is not None and self.state in ("absent", "unknown"):

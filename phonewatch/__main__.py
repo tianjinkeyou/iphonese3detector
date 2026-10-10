@@ -123,10 +123,10 @@ def main():
             now = time.monotonic()
             at = datetime.now()
             elapsed, changed = timer.update(present, now)
-            store.record(at, elapsed, timer.state, changed)
-            total = store.total(at.date().isoformat())
+            store.record(at, elapsed, timer.state, changed, timer.interval_state)
+            totals = store.totals(at.date().isoformat())
             if changed or now - last_log >= 10:
-                print(f"{at:%Y-%m-%d %H:%M:%S} state={timer.state} estimated_usage={total / 60:.1f} min", flush=True)
+                print(f"{at:%Y-%m-%d %H:%M:%S} state={timer.state} absent={totals['absent'] / 60:.1f} min unknown={totals['unknown'] / 60:.1f} min legacy={totals['legacy'] / 60:.1f} min", flush=True)
                 last_log = now
             if ok and frame is not None and now >= next_photo:
                 path = photos / f"{at:%Y-%m-%d_%H-%M-%S_%f}.jpg"
@@ -136,9 +136,13 @@ def main():
             if last_frame is not None:
                 display = last_frame.copy()
                 color = STATE_COLORS[timer.state]
-                cv2.putText(display, f"{timer.state.upper()} | usage today: {total/60:.1f} min", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.putText(display, timer.state.upper(), (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.putText(display, f"ABSENT today: {totals['absent']/60:.1f} min", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, STATE_COLORS["absent"], 2)
+                cv2.putText(display, f"UNKNOWN / UNCERTAIN: {totals['unknown']/60:.1f} min", (12, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, STATE_COLORS["unknown"], 2)
+                if totals['legacy']:
+                    cv2.putText(display, f"Legacy unsplit: {totals['legacy']/60:.1f} min", (12, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2)
                 if present is None:
-                    cv2.putText(display, "UNCERTAIN - counting time" if ok else "CAMERA ERROR - counting time", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, STATE_COLORS["unknown"], 2)
+                    cv2.putText(display, "UNCERTAIN - counting time" if ok else "CAMERA ERROR - counting time", (12, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, STATE_COLORS["unknown"], 2)
                 cv2.imshow(window, display)
             key = cv2.waitKey(30) & 0xFF
             if key in (27, ord("q")):
@@ -146,11 +150,11 @@ def main():
             if key in (ord("e"), ord("f")) and ok and frame is not None:
                 references.save("empty" if key == ord("e") else "phone", region)
                 elapsed, changed = timer.update(None, time.monotonic())
-                store.record(datetime.now(), elapsed, "unknown", changed)
+                store.record(datetime.now(), elapsed, "unknown", changed, timer.interval_state)
                 print("Reference saved. Keep camera/area fixed. E=empty, F=phone.", flush=True)
             if key == ord("p") and ok and frame is not None:
                 elapsed, changed = timer.update(None, time.monotonic())
-                store.record(datetime.now(), elapsed, "unknown", changed)
+                store.record(datetime.now(), elapsed, "unknown", changed, timer.interval_state)
                 selected = select_plane(frame)
                 if selected is not None:
                     save_plane(plane_path, selected, frame.shape)
@@ -163,7 +167,7 @@ def main():
             if key == ord("r") and ok and frame is not None:
                 # Selection is unobserved time: count it as unknown until observations stabilize.
                 elapsed, changed = timer.update(None, time.monotonic())
-                store.record(datetime.now(), elapsed, "unknown", changed)
+                store.record(datetime.now(), elapsed, "unknown", changed, timer.interval_state)
                 selected = cv2.selectROI(window, frame, showCrosshair=True, fromCenter=False)
                 if selected[2] and selected[3]:
                     roi = selected

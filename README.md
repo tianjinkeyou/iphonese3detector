@@ -38,7 +38,7 @@ python -m phonewatch --camera 0
 - 按 **Q** 或 Esc 退出。
 - `PRESENT`（绿色）：手机在区域内，不计时；`ABSENT`（红色）：手机离开，累计时间；`UNKNOWN`/`UNCERTAIN`（黄色）：未知或不确定，也累计时间。
 - 摄像头读取失败时显示黄色 UNKNOWN 并继续计时，恢复后重新确认状态。程序关闭期间不计时。
-- `data/usage.sqlite3` 保存每日秒数和状态变化；`data/photos/` 保存原始全画面照片。
+- `data/usage.sqlite3` 的 daily_state 表按天分别保存 absent/unknown 秒数，events 表保存状态变化；`data/photos/` 保存原始全画面照片。
 - 数据和模型已加入 `.gitignore`。照片可能包含家庭隐私，不应上传；请与孩子明确说明监测用途。
 - 照片没有自动删除功能，需定期清理以避免磁盘占满。
 
@@ -123,4 +123,10 @@ python -m phonewatch --camera /dev/video2 --detector reference --delay 5
 
 此模式不加载模型，也不使用智能特征匹配。默认 auto 与 smart 相同。智能方式仍只判断区域内是否存在手机/学习到的外观，并非手机身份认证；相似物品仍可能误报。手机必须留在框选区域内，较大摄像头移位、明显改变角度或光照需重新 R/E/F，不能保证任何移动都能识别。首轮 CPU 模型加载和漏检时的多角度推理可能较慢，可加 `--detection-mode fast` 降低负载。
 
-新版计时规则：每日累计包含 ABSENT 和 UNKNOWN/UNCERTAIN 的运行时间（包括首次确认、校准等待和摄像头异常）；只有确认 PRESENT 时停止。未知状态立即显示黄色，PRESENT/ABSENT 仍使用 --delay 防抖。程序关闭期间不计时；历史记录保留，不追溯修改。
+新版计时规则：每日分别统计 ABSENT 和 UNKNOWN/UNCERTAIN 的运行时间（包括首次确认、校准等待和摄像头异常）；只有确认 PRESENT 时停止。未知状态立即显示黄色，PRESENT/ABSENT 仍使用 --delay 防抖。程序关闭期间不计时；历史记录保留，不追溯修改。
+
+## 分开统计离开时间和不确定时间
+
+画面分别显示红色 `ABSENT today` 和黄色 `UNKNOWN / UNCERTAIN`。UNKNOWN 与 UNCERTAIN 合并为一项，不加入 ABSENT 时间；PRESENT 不计时。跨日会分别归入当天，重启保留累计值。状态切换前的间隔归属于旧状态，避免切换时误记。
+
+升级前的混合累计保留在原 daily 表，画面单独显示灰色 `Legacy unsplit`，不会假装拆分为新类别，也不会清空历史数据。新数据保存到 daily_state 表，不再写入旧 daily 表。
