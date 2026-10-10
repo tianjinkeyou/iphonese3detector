@@ -1,0 +1,6 @@
+# Optional smart-watch dependencies (Python 3.10-3.12).
+# This MediaPipe release bundles the hand models: no separate model download.
+mediapipe==0.10.21
+opencv-contrib-python==4.11.0.86
+jax==0.4.35
+jaxlib==0.4.35

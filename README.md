@@ -151,3 +151,25 @@ E 必须在手机拿走且手离开画面时保存，F 必须在手机放好且�
 新文件分别保存在 `data/references/empty/` 和 `data/references/phone/`。按 **C 两次（3 秒内）** 清空全部 E/F 样本并重新采集；不会清空计时、照片或区域设置。重新按 R/P 确认区域会清空旧区域的全部样本，请不要为了每个姿势重新按 R。
 
 建议先保存 3～5 张有明显区别的 E、5～10 张不同姿势的 F，再测试未保存过的姿势。E 必须没有手机，F 必须有手机；误标样本可能降低准确度，错误时清空重采。样本更多会增加比较耗时，反复保存完全相同的画面帮助不大。程序没有重新训练 YOLO 模型，只扩充本地参考和特征库；相似物品或极暗画面仍可能无法判断。
+
+## 可选 smart-watch：支架上疑似使用监测
+
+- `--detector smart`：原有手机检测、R/E/F 回退和计时。
+- `--detector smart-watch`：上述功能加上手指接近监测、疑似时间单独统计、触发拍照。默认不启用，不影响 smart 模式。
+
+可选依赖支持 Python 3.10–3.12。首次启用安装：
+
+```bash
+source .venv/bin/activate
+sudo apt install -y libportaudio2
+python -m pip install -r requirements-watch.txt
+python -m phonewatch --camera /dev/video2 --detector smart-watch --delay 5 --watch-delay 3
+```
+
+已有 R/E/F 区域与样本可继续使用。必须用 R 框选手机停放区域（保留少量移动余量），或使用已有 P 校准/--roi；没有指定区域时只做原有手机检测，窗口提示选择区域，不监测整幅画面中的手。
+
+只有手机当前检测和稳定状态均为 PRESENT，且手指靠近选定区域持续至少 `--watch-delay` 秒，才记录一次疑似使用开始，并立即保存 `data/photos/suspect_*.jpg`。手移开后停止；摄像头失败、手机检测变为 ABSENT/UNKNOWN、进入 R/P/E/F/C 操作时立即停止，不把不可确认的间隔算作疑似使用。程序退出也会结束事件，不计算关闭期间的时间。
+
+画面紫色 `SUSPECTED today` 单独显示疑似时间。数据库 `watch_daily` / `watch_events` 分别保存每日疑似秒数和开始/结束事件、照片路径；不并入 ABSENT 或 UNKNOWN，也不改写旧记录。原有每两分钟拍照继续运行。MediaPipe 手部模型随可选 Python 包安装，本地处理，不上传画面。
+
+此版本检测的是手指在停放区附近停留，不是实际触屏动作或屏幕内容。家长的手、擦拭/整理手机也可能触发；手被遮挡可能漏检；在支架上看视频且不碰手机不会被此规则发现。如果手遮挡手机导致 UNKNOWN，只有不确定时间继续记录，疑似监测暂时停止。请在本地分别验证短暂放回手机、持续靠近手机、远处挥手和摄像头断连，再决定是否长期启用。

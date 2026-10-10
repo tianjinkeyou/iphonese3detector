@@ -16,17 +16,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Local phone parking monitor. Esc/Q exits; R selects area; P calibrates tilted phone plane.")
     parser.add_argument("--camera", default="0", help="camera index or /dev/video path")
     parser.add_argument("--model", default="yolo11n.pt", help="Ultralytics model path (first run downloads weights)")
-    parser.add_argument("--detector", choices=("auto", "smart", "reference", "yolo"), default="auto", help="auto/smart: YOLO, moving features, then R/E/F fallback; reference: old R/E/F only")
+    parser.add_argument("--detector", choices=("auto", "smart", "smart-watch", "reference", "yolo"), default="auto", help="smart: phone detection; smart-watch: optional hand proximity, suspect time/photos; reference: R/E/F only")
     parser.add_argument("--detection-mode", choices=("robust", "fast"), default="robust", help="robust: rotation/low-light fallback; fast: single view")
     parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--watch-delay", type=float, default=3.0, help="continuous hand proximity seconds before suspected use")
     parser.add_argument("--delay", type=float, default=5.0)
     parser.add_argument("--photo-interval", type=float, default=120.0)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--ignore-plane", action="store_true", help="ignore saved perspective calibration for this run")
     parser.add_argument("--roi", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
     args = parser.parse_args()
-    if not all(math.isfinite(v) for v in (args.delay, args.photo_interval, args.confidence)) or args.delay < 0 or args.photo_interval <= 0 or not 0 < args.confidence <= 1:
-        parser.error("delay must be >=0, photo-interval >0, confidence in (0,1]")
+    if not all(math.isfinite(v) for v in (args.delay, args.watch_delay, args.photo_interval, args.confidence)) or args.delay < 0 or args.watch_delay < 0 or args.photo_interval <= 0 or not 0 < args.confidence <= 1:
+        parser.error("delay/watch-delay must be >=0, photo-interval >0, confidence in (0,1]")
     if args.roi and (min(args.roi[:2]) < 0 or min(args.roi[2:]) <= 0):
         parser.error("ROI needs nonnegative X/Y and positive width/height")
     return args
@@ -48,6 +49,8 @@ def main():
     camera = int(args.camera) if args.camera.isdecimal() else args.camera
     capture = cv2.VideoCapture(camera)
     store = None
+    hand_tracker = None
+    watch_timer = None
     try:
         if not capture.isOpened():
             raise RuntimeError("Cannot open camera. Check --camera and Ubuntu camera permissions.")
@@ -65,6 +68,13 @@ def main():
         photos = args.data_dir / "photos"
         photos.mkdir(exist_ok=True)
         timer = UsageTimer(args.delay)
+        if args.detector == "smart-watch":
+            from .hand_tracking import HandTracker
+            from .watch import WatchTimer, hand_near_polygon
+            hand_tracker = HandTracker()
+            watch_timer = WatchTimer(args.watch_delay)
+        watch_label = "WATCH: select parking area with R or P"
+        watch_total = 0.0
         roi_path=args.data_dir / "parking-area.json"
         roi = tuple(args.roi) if args.roi else None
         if roi is None and roi_path.exists():
@@ -98,7 +108,7 @@ def main():
                     region, inverse = rectify(frame, plane)
                 started = time.monotonic()
                 polygons = []
-                if args.detector in ("auto", "smart"):
+                if args.detector in ("auto", "smart", "smart-watch"):
                     present, method, polygons = smart.detect(region)
                 elif args.detector == "reference":
                     present, method = references.detect(region)
@@ -130,6 +140,44 @@ def main():
             at = datetime.now()
             elapsed, changed = timer.update(present, now)
             store.record(at, elapsed, timer.state, changed, timer.interval_state)
+            if watch_timer is not None:
+                near = None
+                # Only explicit parking-area geometry is meaningful for hand proximity.
+                phone_confirmed = ok and present is True and timer.state == "present"
+                if phone_confirmed and (roi is not None or plane is not None):
+                    hands = hand_tracker.detect(frame)
+                    if plane is not None:
+                        watch_polygon = plane
+                    else:
+                        import numpy as np
+                        watch_polygon = np.float32([[x,y],[x+w,y],[x+w,y+h],[x,y+h]])
+                    near = hand_near_polygon(hands,watch_polygon,frame.shape)
+                    for hand in hands:
+                        for index in (4,8,12,16,20):
+                            px,py = hand[index]
+                            cv2.circle(last_frame,(int(px*width),int(py*height)),4,(255,0,255),-1)
+                watch_now = time.monotonic()
+                watch_elapsed, watch_started, watch_changed = watch_timer.update(near,bool(phone_confirmed),watch_now)
+                watch_at = datetime.now()
+                photo = None
+                if watch_started:
+                    photo_path = photos / f"suspect_{watch_at:%Y-%m-%d_%H-%M-%S_%f}.jpg"
+                    if not cv2.imwrite(str(photo_path),frame):
+                        raise RuntimeError(f"Could not save suspected-use photo: {photo_path}")
+                    photo = str(photo_path.relative_to(args.data_dir))
+                    print(f"Suspected use started; photo saved: {photo}",flush=True)
+                store.record_watch(watch_at,watch_elapsed,watch_timer.active,watch_changed,photo)
+                watch_total = store.watch_total(watch_at.date().isoformat())
+                if roi is None and plane is None:
+                    watch_label = "WATCH: select parking area with R or P"
+                elif not phone_confirmed:
+                    watch_label = "WATCH: waiting for confirmed PRESENT"
+                elif watch_timer.active:
+                    watch_label = "WATCH: SUSPECTED USE - hand near phone"
+                elif near:
+                    watch_label = "WATCH: hand near phone, confirming..."
+                else:
+                    watch_label = "WATCH: no hand near phone"
             totals = store.totals(at.date().isoformat())
             if changed or now - last_log >= 10:
                 print(f"{at:%Y-%m-%d %H:%M:%S} state={timer.state} absent={totals['absent'] / 60:.1f} min unknown={totals['unknown'] / 60:.1f} min legacy={totals['legacy'] / 60:.1f} min", flush=True)
@@ -147,12 +195,18 @@ def main():
                 cv2.putText(display, f"UNKNOWN / UNCERTAIN: {totals['unknown']/60:.1f} min", (12, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, STATE_COLORS["unknown"], 2)
                 if totals['legacy']:
                     cv2.putText(display, f"Legacy unsplit: {totals['legacy']/60:.1f} min", (12, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2)
+                if watch_timer is not None:
+                    cv2.putText(display,f"SUSPECTED today: {watch_total/60:.1f} min",(12,180),cv2.FONT_HERSHEY_SIMPLEX,0.65,(255,0,255),2)
+                    cv2.putText(display,watch_label,(12,210),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,0,255),2)
                 if present is None:
                     cv2.putText(display, "UNCERTAIN - counting time" if ok else "CAMERA ERROR - counting time", (12, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, STATE_COLORS["unknown"], 2)
                 cv2.imshow(window, display)
             key = cv2.waitKey(30) & 0xFF
             if key in (27, ord("q")):
                 break
+            if watch_timer is not None and key in (ord("c"),ord("e"),ord("f"),ord("p"),ord("r")):
+                watch_elapsed, _, watch_changed = watch_timer.update(None,False,time.monotonic())
+                store.record_watch(datetime.now(),watch_elapsed,watch_timer.active,watch_changed)
             if key == ord("c"):
                 pressed_at = time.monotonic()
                 if pressed_at < clear_deadline:
@@ -200,8 +254,13 @@ def main():
             if not ok:
                 time.sleep(0.2)
     finally:
+        if watch_timer is not None and watch_timer.active and store is not None:
+            watch_timer.reset(time.monotonic())
+            store.record_watch(datetime.now(),0.0,False,True)
         capture.release()
         cv2.destroyAllWindows()
+        if hand_tracker is not None:
+            hand_tracker.close()
         if store is not None:
             store.close()
 
