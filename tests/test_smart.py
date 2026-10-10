@@ -33,8 +33,8 @@ class SmartTests(unittest.TestCase):
             def detect(self,image):
                 return [np.array([[0,0],[10,0],[10,10],[0,10]])],'normal'
         smart=SmartDetector(self.refs,Model)
-        self.assertTrue(smart.detect(self.empty)[0])
-        self.assertIn('YOLO',smart.detect(self.empty)[1])
+        self.assertTrue(smart.detect(self.phone)[0])
+        self.assertIn('YOLO',smart.detect(self.phone)[1])
 
     def test_phone_features_survive_translation_and_rotation(self):
         matrix=cv2.getRotationMatrix2D((100,120),4,1.02)
@@ -88,3 +88,31 @@ class SmartTests(unittest.TestCase):
         self.assertTrue(smart.detect(self.phone)[0])
         self.refs.clear()
         self.assertIsNone(smart.detect(self.phone)[0])
+
+    def test_false_yolo_detection_cannot_override_empty_reference(self):
+        class FalsePositive:
+            def detect(self,image):
+                return [np.array([[10,10],[30,10],[30,30],[10,30]])],'false positive'
+        state,label,boxes=SmartDetector(self.refs,FalsePositive).detect(self.empty)
+        self.assertFalse(state)
+        self.assertIn('E empty confirmed',label)
+        self.assertEqual(boxes,[])
+
+    def test_false_feature_match_cannot_override_empty_reference(self):
+        from unittest.mock import patch
+        smart=SmartDetector(self.refs,MissModel)
+        with patch.object(smart,'_match',return_value=True):
+            self.assertFalse(smart.detect(self.empty)[0])
+
+    def test_less_certain_empty_conflict_becomes_unknown(self):
+        from unittest.mock import patch
+        class FalsePositive:
+            def detect(self,image):
+                return [np.array([[10,10],[30,10],[30,30],[10,30]])],'positive'
+        smart=SmartDetector(self.refs,FalsePositive)
+        evidence=(False,'empty favored',{'empty':.04,'phone':.1})
+        with patch('phonewatch.smart._reference_evidence',return_value=evidence):
+            state,label,boxes=smart.detect(self.empty)
+        self.assertIsNone(state)
+        self.assertIn('CONFLICT',label)
+        self.assertEqual(boxes,[])

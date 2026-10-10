@@ -130,3 +130,9 @@ python -m phonewatch --camera /dev/video2 --detector reference --delay 5
 画面分别显示红色 `ABSENT today` 和黄色 `UNKNOWN / UNCERTAIN`。UNKNOWN 与 UNCERTAIN 合并为一项，不加入 ABSENT 时间；PRESENT 不计时。跨日会分别归入当天，重启保留累计值。状态切换前的间隔归属于旧状态，避免切换时误记。
 
 升级前的混合累计保留在原 daily 表，画面单独显示灰色 `Legacy unsplit`，不会假装拆分为新类别，也不会清空历史数据。新数据保存到 daily_state 表，不再写入旧 daily 表。
+
+## 智能检测与 E 空支架冲突的处理
+
+新版智能检测不会无条件覆盖 E/F：与 E 高度一致且明显不同于 F 时，即使 YOLO 或特征匹配误报手机，也判为 ABSENT；参考图偏向 E 但证据不够强、与智能结果冲突时判为黄色 UNKNOWN，单独计入不确定时间。没有空支架冲突时继续优先采用智能检测。底部会显示 `E empty confirmed; smart rejected` 或 `CONFLICT smart vs E` 及距离数值。
+
+E 必须在手机拿走且手离开画面时保存，F 必须在手机放好且手离开画面时保存；两个标签不能反过来。ABSENT/PRESENT 切换仍有 --delay 防抖，请等待确认时间。原有校准可继续使用。

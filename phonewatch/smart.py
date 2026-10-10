@@ -4,21 +4,21 @@ import numpy as np
 from .reference import feature, ReferenceDetector
 
 
-def moving_reference(references, image):
+def _reference_evidence(references, image):
     """Bounded translations/rotations, never an unrestricted background match."""
     if not references.ready:
-        return None, 'fallback: press R, E=empty, F=phone'
+        return None, 'fallback: press R, E=empty, F=phone', None
     if any(ref.shape != image.shape for ref in references.images.values()):
-        return None, 'fallback: area changed; recalibrate R/E/F'
+        return None, 'fallback: area changed; recalibrate R/E/F', None
     gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
     if np.percentile(gray,95) < 8:
-        return None, 'too dark; counting time'
+        return None, 'too dark; counting time', None
     current=feature(image)
     empty=feature(references.images['empty'])
     phone=feature(references.images['phone'])
     separation=ReferenceDetector.distance(empty,phone)
     if separation < .025:
-        return None, 'fallback: references too similar; redo R/E/F'
+        return None, 'fallback: references too similar; redo R/E/F', None
     # Features are 96x128; allow ~6% camera/stand jitter and +/-5 degrees.
     distances=[]
     for ref in (empty,phone):
@@ -33,9 +33,15 @@ def moving_reference(references, image):
                     best=min(best,ReferenceDetector.distance(aligned,target))
         distances.append(best)
     de,dp=distances
+    evidence={"empty":de,"phone":dp}
     if abs(de-dp) < max(.012,separation*.2) or min(de,dp) > max(.08,separation*.65):
-        return None,f'fallback uncertain E={de:.3f} F={dp:.3f}'
-    return dp < de,f'fallback R/E/F E={de:.3f} F={dp:.3f}'
+        return None,f'fallback uncertain E={de:.3f} F={dp:.3f}',evidence
+    return dp < de,f'fallback R/E/F E={de:.3f} F={dp:.3f}',evidence
+
+
+def moving_reference(references,image):
+    state,label,_=_reference_evidence(references,image)
+    return state,label
 
 
 class SmartDetector:
@@ -108,17 +114,24 @@ class SmartDetector:
     def detect(self,image):
         if np.percentile(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),95)<8:
             return None,'too dark; counting time',[]
+        ref_state,ref_label,evidence=_reference_evidence(self.references,image)
+        def reconcile(label,polygons):
+            if ref_state is False:
+                de,dp=evidence["empty"],evidence["phone"]
+                if de < .02 and dp-de > max(.025,3*de):
+                    return False,f"E empty confirmed; smart rejected E={de:.3f} F={dp:.3f}",[]
+                return None,f"CONFLICT smart vs E; uncertain E={de:.3f} F={dp:.3f}",[]
+            return True,label,polygons
         if not self.model_failed:
             try:
                 if self.model is None:
                     self.model=self.model_factory()
                 polygons,label=self.model.detect(image)
                 if polygons:
-                    return True,f'smart YOLO: {label}',polygons
+                    return reconcile(f'smart YOLO: {label}',polygons)
             except Exception as exc:
                 self.model_failed=True
                 print(f'Smart model unavailable ({type(exc).__name__}: {exc}); continuing feature/reference detection.',flush=True)
         if self._match(image):
-            return True,'smart: moving phone features',[]
-        state,label=moving_reference(self.references,image)
-        return state,label,[]
+            return reconcile('smart: moving phone features',[])
+        return ref_state,ref_label,[]
