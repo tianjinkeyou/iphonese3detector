@@ -10,13 +10,15 @@ from .timer import UsageTimer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Local phone parking monitor. Esc/Q exits; R selects parking area.")
+    parser = argparse.ArgumentParser(description="Local phone parking monitor. Esc/Q exits; R selects area; P calibrates tilted phone plane.")
     parser.add_argument("--camera", default="0", help="camera index or /dev/video path")
     parser.add_argument("--model", default="yolo11n.pt", help="Ultralytics model path (first run downloads weights)")
+    parser.add_argument("--detection-mode", choices=("robust", "fast"), default="robust", help="robust: rotation/low-light fallback; fast: single view")
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--delay", type=float, default=5.0)
     parser.add_argument("--photo-interval", type=float, default=120.0)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--ignore-plane", action="store_true", help="ignore saved perspective calibration for this run")
     parser.add_argument("--roi", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
     args = parser.parse_args()
     if not all(math.isfinite(v) for v in (args.delay, args.photo_interval, args.confidence)) or args.delay < 0 or args.photo_interval <= 0 or not 0 < args.confidence <= 1:
@@ -35,6 +37,8 @@ def main():
     os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir.resolve()))
     import cv2
     from ultralytics import YOLO
+    from .detection import PhoneDetector
+    from .perspective import load_plane, save_plane, select_plane, rectify, map_polygon
 
     camera = int(args.camera) if args.camera.isdecimal() else args.camera
     capture = cv2.VideoCapture(camera)
@@ -47,13 +51,17 @@ def main():
         phone_classes = [i for i, label in labels.items() if label == "cell phone"]
         if not phone_classes:
             raise RuntimeError("Model has no 'cell phone' class. Use a COCO detection model.")
+        detector = PhoneDetector(model, phone_classes, args.confidence, args.detection_mode)
         store = Store(args.data_dir)
         photos = args.data_dir / "photos"
         photos.mkdir(exist_ok=True)
         timer = UsageTimer(args.delay)
         roi = tuple(args.roi) if args.roi else None
         next_photo = time.monotonic() + args.photo_interval
-        window = "Phone parking monitor - Q: quit / R: select area"
+        plane_path = args.data_dir / "parking-plane.json"
+        plane = None
+        plane_checked = False
+        window = "Phone parking monitor - Q: quit / R: area / P: tilted plane"
         last_frame = None
         last_log = 0.0
         while True:
@@ -63,12 +71,26 @@ def main():
                 x, y, w, h = roi or (0, 0, width, height)
                 if x + w > width or y + h > height:
                     raise RuntimeError("ROI exceeds camera image. Select a smaller area.")
+                if not plane_checked:
+                    plane = None if args.ignore_plane or args.roi else load_plane(plane_path, frame.shape)
+                    plane_checked = True
                 region = frame[y:y+h, x:x+w]
-                result = model.predict(region, classes=phone_classes, conf=args.confidence, verbose=False, device="cpu")[0]
-                present = len(result.boxes) > 0
+                inverse = None
+                if plane is not None:
+                    region, inverse = rectify(frame, plane)
+                started = time.monotonic()
+                polygons, method = detector.detect(region)
+                inference_ms = (time.monotonic() - started) * 1000
+                present = bool(polygons)
                 display = frame.copy()
-                display[y:y+h, x:x+w] = result.plot()
-                cv2.rectangle(display, (x, y), (x+w-1, y+h-1), (255, 180, 0), 2)
+                for polygon in polygons:
+                    mapped = map_polygon(polygon, inverse) if inverse is not None else polygon + (x, y)
+                    cv2.polylines(display, [mapped], True, (0, 255, 0), 2)
+                cv2.putText(display, f"{method} | {inference_ms:.0f} ms", (12, height - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                if plane is not None:
+                    cv2.polylines(display, [plane.astype("int32")], True, (255, 180, 0), 2)
+                else:
+                    cv2.rectangle(display, (x, y), (x+w-1, y+h-1), (255, 180, 0), 2)
                 last_frame = display
             else:
                 present = None
@@ -96,6 +118,14 @@ def main():
             key = cv2.waitKey(30) & 0xFF
             if key in (27, ord("q")):
                 break
+            if key == ord("p") and ok and frame is not None:
+                timer.update(None, time.monotonic())
+                store.record(datetime.now(), 0, "unknown", True)
+                selected = select_plane(frame)
+                if selected is not None:
+                    save_plane(plane_path, selected, frame.shape)
+                    plane = selected
+                    print("Saved tilted phone plane. Recalibrate if camera or stand moves.", flush=True)
             if key == ord("r") and ok and frame is not None:
                 # Selection is unobserved time: stop counting until fresh observations stabilize.
                 timer.update(None, time.monotonic())
@@ -103,6 +133,8 @@ def main():
                 selected = cv2.selectROI(window, frame, showCrosshair=True, fromCenter=False)
                 if selected[2] and selected[3]:
                     roi = selected
+                    plane = None
+                    plane_path.unlink(missing_ok=True)
                     print(f"Reuse this area with --roi {' '.join(map(str, roi))}", flush=True)
             if not ok:
                 time.sleep(0.2)
