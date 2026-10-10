@@ -1,4 +1,5 @@
 import itertools
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -33,13 +34,20 @@ class ApplicationTests(unittest.TestCase):
                 main()
             self.assertTrue(camera.released)
             photos=list((Path(tmp)/'photos').glob('*.jpg'))
-            self.assertEqual(len(photos),7)
+            # Scheduled photos continue alongside the new pickup snapshot.
+            self.assertEqual(len(photos),9)
+            self.assertEqual(len(list((Path(tmp)/'photos').glob('pickup_*.jpg'))),1)
+            self.assertEqual(len(list((Path(tmp)/'photos').glob('before_pickup_*.jpg'))),1)
             self.assertIsNotNone(cv2.imread(str(photos[0])))
             db=sqlite3.connect(Path(tmp)/'usage.sqlite3')
             states=[row[0] for row in db.execute('SELECT state FROM events')]
             self.assertIn('present',states)
             self.assertIn('absent',states)
             self.assertGreater(db.execute('SELECT SUM(seconds) FROM daily_state').fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM activity_events WHERE kind='pickup'").fetchone()[0],1)
+            exports=list((Path(tmp)/'events').glob('*.txt'))
+            entries=[json.loads(line) for line in exports[0].read_text(encoding='utf-8').splitlines() if line and not line.startswith('#')]
+            self.assertEqual(sum(event['event']=='photo_saved' for event in entries),7)
             db.close()
 
     def test_smart_fallback_roi_persists_across_restart(self):

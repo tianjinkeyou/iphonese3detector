@@ -131,6 +131,36 @@ python -m phonewatch --camera /dev/video2 --detector reference --delay 5
 
 升级前的混合累计保留在原 daily 表，画面单独显示灰色 `Legacy unsplit`，不会假装拆分为新类别，也不会清空历史数据。新数据保存到 daily_state 表，不再写入旧 daily 表。
 
+## 拿起次数与 AI 分析用事件文本
+
+新版在 `auto`、`smart`、`reference`、`yolo`、`smart-watch` 模式中都自动统计拿起次数，无需额外开启。画面显示 `PICKUPS today`，按天保存、重启保留。原有启动命令可继续使用。
+
+一次拿起是**摄像头观察到的稳定 PRESENT → ABSENT 变化**：先确认手机在停放区，再确认离开，才加一次；持续离开不会重复加次数，确认放回后才能开始下一次。拿起/放回使用独立的 `--pickup-delay`，默认 1 秒；原有离开时间的 `--delay` 仍默认 5 秒。因此较短的拿走也可能记录一次，而离开计时状态尚未切换。低帧率下，发生在两帧之间的拿走/放回仍可能漏记。
+
+短暂 UNKNOWN（最多 2 秒）允许桥接前后的确认状态，但 UNKNOWN 不计入拿起/放回的确认时间，并会在事件中保留 `unknown_seconds`，供分析时识别证据缺口。较长 UNKNOWN、摄像头断连、程序重启或校准操作会重新建立基线，不推测缺失画面中的拿起次数。启动时手机已不在区域内，不算一次拿起；旧版记录也不会追溯生成次数。
+
+每次确认拿起、以及该次拿起后确认放回时，触发原始全画面快照，保存在 `data/photos/pickup_*.jpg`、`return_*.jpg`。事件中的 `photo_path` 相对于 `--data-dir`，例如 `photos/pickup_example.jpg`。照片保存失败时保留 `photo_path: null` 和 `photo_error`，已确认的拿起次数仍会保存。拿起次数和事件以同一个 `data/usage.sqlite3` 数据库的 `activity_events` 表为准，不依赖文本行数统计。放回事件的 `away_seconds` 表示从确认拿起到确认放回的间隔，可能包含短暂 UNKNOWN；它不等于已确认的使用时间或 ABSENT 计时。
+
+拿起时还保存最近一次确认 PRESENT 的原始画面 `before_pickup_*.jpg`；事件中的 `before_photo_path` 指向它，`before_photo_time` 保留原画面的采集时间。对应的拿起与放回事件共享 `cycle_id`，便于比较拿走前和放回后的手机外观。长 UNKNOWN 恢复时记录 `unobserved_change` 和恢复后的照片；若此前有确认 PRESENT 的画面，也保存 `before_unobserved_change_*.jpg` 供前后核查，但不增加拿起次数。这些照片可以辅助发现外观变化，仍不能证明手机身份。
+
+事件文本自动写入 `data/events/YYYY-MM-DD.txt`，使用 UTF-8：文件开头说明字段，之后每行是一条 JSON 事件，便于直接交给 AI 分析。每次运行保留独立的 `session` 标识；记录手机状态变化、拿起/放回、摄像头异常及恢复、E/F 样本和区域校准操作，以及启用 `smart-watch` 后的疑似使用开始/结束。约每 5 分钟、以及程序正常退出时，写入一次 `summary`，包含当天拿起次数、离开秒数、不确定秒数、疑似使用秒数和本次运行时间。重启追加新记录，不覆盖旧记录。文本导出失败时，SQLite 中的事件仍然保留，终端会打印诊断；后续成功导出时会恢复文本记录。
+
+例如，下面一行表示摄像头确认手机离开，时间包含本地 UTC 偏移：
+
+```json
+{"id": 12, "time": "2026-10-10T19:30:02+09:00", "event": "pickup", "session": "example-session", "details": {"from_state": "present", "to_state": "absent", "method": "fallback R/E/F", "photo_path": "photos/pickup_example.jpg", "unknown_seconds": 0}}
+```
+
+可以将 TXT 和需要核查的对应照片交给 AI，辅助寻找“连续几小时没有拿起”“频繁短暂拿起”“大量 UNKNOWN”“手机放着但疑似使用持续”等事件组合。程序只在本地输出，不自动上传给 AI。日志和照片可能包含家庭隐私，分享前请检查内容。
+
+相似的旧手机放在支架上，尤其没有拍到明确的拿走/放回过程时，现有算法不能确认手机身份，也不能仅凭拿起次数为零判定作弊。记录用于辅助核查，应结合照片、未知间隔、摄像头在线时间和实际情况分析。
+
+需要更敏感时，可使用 `--pickup-delay 0.5`；短暂遮挡和漏检也更容易变成拿起记录。建议先在本地验证：
+
+1. 手机放好并等待确认，拿走超过 1 秒，再放回等待确认；次数应增加 1，TXT 应出现 `pickup` 和 `return`，并有两张事件照片。
+2. 手机拿走后再启动程序；应显示 ABSENT，但不能凭启动状态增加拿起次数。
+3. 手机放好后断开摄像头、拿走手机，再恢复摄像头；应记录摄像头异常和 UNKNOWN，不能推测断连期间的拿起次数。再次正常放回、拿走后，才记录新的一次。
+
 ## 智能检测与 E 空支架冲突的处理
 
 新版智能检测不会无条件覆盖 E/F：与 E 高度一致且明显不同于 F 时，即使 YOLO 或特征匹配误报手机，也判为 ABSENT；参考图偏向 E 但证据不够强、与智能结果冲突时判为黄色 UNKNOWN，单独计入不确定时间。没有空支架冲突时继续优先采用智能检测。底部会显示 `E empty confirmed; smart rejected` 或 `CONFLICT smart vs E` 及距离数值。
