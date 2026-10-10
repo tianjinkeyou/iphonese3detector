@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class UsageTimer:
-    """Use monotonic timestamps. Unknown intervals never count as usage."""
+    """Use monotonic timestamps. Absent and unknown intervals count; present intervals do not."""
 
     delay: float = 5.0
     state: str = "unknown"
@@ -15,8 +15,9 @@ class UsageTimer:
         if self.previous is not None and now < self.previous:
             raise ValueError("timestamps must be monotonic")
         elapsed = 0.0
-        # Only charge intervals bounded by valid observations.
-        if self.previous is not None and present is not None and self.state == "absent":
+        # Charge the interval according to the previous displayed state.
+        # A new observation takes effect at now, without retroactive charging.
+        if self.previous is not None and self.state in ("absent", "unknown"):
             elapsed = now - self.previous
         self.previous = now
         before = self.state

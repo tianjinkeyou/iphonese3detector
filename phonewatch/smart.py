@@ -12,7 +12,7 @@ def moving_reference(references, image):
         return None, 'fallback: area changed; recalibrate R/E/F'
     gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
     if np.percentile(gray,95) < 8:
-        return None, 'too dark; timer paused'
+        return None, 'too dark; counting time'
     current=feature(image)
     empty=feature(references.images['empty'])
     phone=feature(references.images['phone'])
@@ -107,7 +107,7 @@ class SmartDetector:
 
     def detect(self,image):
         if np.percentile(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),95)<8:
-            return None,'too dark; timer paused',[]
+            return None,'too dark; counting time',[]
         if not self.model_failed:
             try:
                 if self.model is None:

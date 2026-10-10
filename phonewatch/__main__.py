@@ -9,6 +9,9 @@ from .storage import Store
 from .timer import UsageTimer
 
 
+STATE_COLORS = {"present": (0, 255, 0), "absent": (0, 0, 255), "unknown": (0, 255, 255)}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Local phone parking monitor. Esc/Q exits; R selects area; P calibrates tilted phone plane.")
     parser.add_argument("--camera", default="0", help="camera index or /dev/video path")
@@ -132,22 +135,22 @@ def main():
                 next_photo = now + args.photo_interval
             if last_frame is not None:
                 display = last_frame.copy()
-                color = (0, 0, 255) if timer.state == "unknown" else (0, 255, 0)
+                color = STATE_COLORS[timer.state]
                 cv2.putText(display, f"{timer.state.upper()} | usage today: {total/60:.1f} min", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                 if present is None:
-                    cv2.putText(display, "UNCERTAIN - timer paused" if ok else "CAMERA ERROR - timer paused", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    cv2.putText(display, "UNCERTAIN - counting time" if ok else "CAMERA ERROR - counting time", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, STATE_COLORS["unknown"], 2)
                 cv2.imshow(window, display)
             key = cv2.waitKey(30) & 0xFF
             if key in (27, ord("q")):
                 break
             if key in (ord("e"), ord("f")) and ok and frame is not None:
                 references.save("empty" if key == ord("e") else "phone", region)
-                timer.update(None, time.monotonic())
-                store.record(datetime.now(), 0, "unknown", True)
+                elapsed, changed = timer.update(None, time.monotonic())
+                store.record(datetime.now(), elapsed, "unknown", changed)
                 print("Reference saved. Keep camera/area fixed. E=empty, F=phone.", flush=True)
             if key == ord("p") and ok and frame is not None:
-                timer.update(None, time.monotonic())
-                store.record(datetime.now(), 0, "unknown", True)
+                elapsed, changed = timer.update(None, time.monotonic())
+                store.record(datetime.now(), elapsed, "unknown", changed)
                 selected = select_plane(frame)
                 if selected is not None:
                     save_plane(plane_path, selected, frame.shape)
@@ -158,9 +161,9 @@ def main():
                     references.clear()
                     print("Saved tilted phone plane. Recalibrate if camera or stand moves.", flush=True)
             if key == ord("r") and ok and frame is not None:
-                # Selection is unobserved time: stop counting until fresh observations stabilize.
-                timer.update(None, time.monotonic())
-                store.record(datetime.now(), 0, "unknown", True)
+                # Selection is unobserved time: count it as unknown until observations stabilize.
+                elapsed, changed = timer.update(None, time.monotonic())
+                store.record(datetime.now(), elapsed, "unknown", changed)
                 selected = cv2.selectROI(window, frame, showCrosshair=True, fromCenter=False)
                 if selected[2] and selected[3]:
                     roi = selected
