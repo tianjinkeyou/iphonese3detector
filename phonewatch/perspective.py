@@ -52,8 +52,8 @@ def load_plane(path: Path, frame_shape):
     return points
 
 
-def select_plane(frame):
-    window = "Click phone corners: top-left, top-right, bottom-right, bottom-left. Enter saves; Esc cancels"
+def select_plane(frame, window_title=None):
+    window = window_title or "Click phone corners: top-left, top-right, bottom-right, bottom-left. Enter saves; Esc cancels"
     points = []
     def click(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
