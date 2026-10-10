@@ -1,0 +1,122 @@
+import argparse
+import math
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+
+from .storage import Store
+from .timer import UsageTimer
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Local phone parking monitor. Esc/Q exits; R selects parking area.")
+    parser.add_argument("--camera", default="0", help="camera index or /dev/video path")
+    parser.add_argument("--model", default="yolo11n.pt", help="Ultralytics model path (first run downloads weights)")
+    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--delay", type=float, default=5.0)
+    parser.add_argument("--photo-interval", type=float, default=120.0)
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--roi", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
+    args = parser.parse_args()
+    if not all(math.isfinite(v) for v in (args.delay, args.photo_interval, args.confidence)) or args.delay < 0 or args.photo_interval <= 0 or not 0 < args.confidence <= 1:
+        parser.error("delay must be >=0, photo-interval >0, confidence in (0,1]")
+    if args.roi and (min(args.roi[:2]) < 0 or min(args.roi[2:]) <= 0):
+        parser.error("ROI needs nonnegative X/Y and positive width/height")
+    return args
+
+
+def main():
+    args = parse_args()
+    # Private permissions for newly created local records/photos.
+    os.umask(0o077)
+    config_dir = args.data_dir / "yolo"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir.resolve()))
+    import cv2
+    from ultralytics import YOLO
+
+    camera = int(args.camera) if args.camera.isdecimal() else args.camera
+    capture = cv2.VideoCapture(camera)
+    store = None
+    try:
+        if not capture.isOpened():
+            raise RuntimeError("Cannot open camera. Check --camera and Ubuntu camera permissions.")
+        model = YOLO(args.model)
+        labels = model.names
+        phone_classes = [i for i, label in labels.items() if label == "cell phone"]
+        if not phone_classes:
+            raise RuntimeError("Model has no 'cell phone' class. Use a COCO detection model.")
+        store = Store(args.data_dir)
+        photos = args.data_dir / "photos"
+        photos.mkdir(exist_ok=True)
+        timer = UsageTimer(args.delay)
+        roi = tuple(args.roi) if args.roi else None
+        next_photo = time.monotonic() + args.photo_interval
+        window = "Phone parking monitor - Q: quit / R: select area"
+        last_frame = None
+        last_log = 0.0
+        while True:
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                height, width = frame.shape[:2]
+                x, y, w, h = roi or (0, 0, width, height)
+                if x + w > width or y + h > height:
+                    raise RuntimeError("ROI exceeds camera image. Select a smaller area.")
+                region = frame[y:y+h, x:x+w]
+                result = model.predict(region, classes=phone_classes, conf=args.confidence, verbose=False, device="cpu")[0]
+                present = len(result.boxes) > 0
+                display = frame.copy()
+                display[y:y+h, x:x+w] = result.plot()
+                cv2.rectangle(display, (x, y), (x+w-1, y+h-1), (255, 180, 0), 2)
+                last_frame = display
+            else:
+                present = None
+            # Timestamp after inference so slow inference is not hidden from accounting.
+            now = time.monotonic()
+            at = datetime.now()
+            elapsed, changed = timer.update(present, now)
+            store.record(at, elapsed, timer.state, changed)
+            total = store.total(at.date().isoformat())
+            if changed or now - last_log >= 10:
+                print(f"{at:%Y-%m-%d %H:%M:%S} state={timer.state} estimated_usage={total / 60:.1f} min", flush=True)
+                last_log = now
+            if ok and frame is not None and now >= next_photo:
+                path = photos / f"{at:%Y-%m-%d_%H-%M-%S_%f}.jpg"
+                if not cv2.imwrite(str(path), frame):
+                    raise RuntimeError(f"Could not save photo: {path}")
+                next_photo = now + args.photo_interval
+            if last_frame is not None:
+                display = last_frame.copy()
+                color = (0, 0, 255) if timer.state == "unknown" else (0, 255, 0)
+                cv2.putText(display, f"{timer.state.upper()} | usage today: {total/60:.1f} min", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                if present is None:
+                    cv2.putText(display, "CAMERA ERROR - timer paused", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.imshow(window, display)
+            key = cv2.waitKey(30) & 0xFF
+            if key in (27, ord("q")):
+                break
+            if key == ord("r") and ok and frame is not None:
+                # Selection is unobserved time: stop counting until fresh observations stabilize.
+                timer.update(None, time.monotonic())
+                store.record(datetime.now(), 0, "unknown", True)
+                selected = cv2.selectROI(window, frame, showCrosshair=True, fromCenter=False)
+                if selected[2] and selected[3]:
+                    roi = selected
+                    print(f"Reuse this area with --roi {' '.join(map(str, roi))}", flush=True)
+            if not ok:
+                time.sleep(0.2)
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+        if store is not None:
+            store.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        raise SystemExit(f"Error: {exc}") from exc
