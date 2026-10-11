@@ -14,15 +14,39 @@ def feature(image):
     return gray, edge
 
 
+class _RawReferenceView:
+    """Live raw E/F access for detectors whose decisions require raw pixels."""
+    def __init__(self, source):
+        self._source = source
+
+    @property
+    def revision(self):
+        return self._source.revision
+
+    @property
+    def counts(self):
+        return self._source.counts
+
+    @property
+    def ready(self):
+        return self._source.ready
+
+    def compatible(self, name, shape):
+        return self._source.raw_compatible(name, shape)
+
+
 class ReferenceDetector:
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, image_transform=None):
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
+        self.image_transform = image_transform
         self.samples = {'empty': [], 'phone': []}
         self.images = {}  # Latest sample, for compatibility with earlier callers.
         self.revision = 0
+        self._image_cache = {}
         self._feature_cache = {}
         self._moving_cache = {}
+        self._raw_proxy = _RawReferenceView(self)
         for name in self.samples:
             legacy = directory / f'{name}.png'
             paths = ([legacy] if legacy.exists() else []) + sorted((directory/name).glob('sample-*.png'))
@@ -44,6 +68,7 @@ class ReferenceDetector:
 
     def _invalidate(self):
         self.revision += 1
+        self._image_cache.clear()
         self._feature_cache.clear()
         self._moving_cache.clear()
 
@@ -70,8 +95,31 @@ class ReferenceDetector:
         self.images[name] = saved
         self._invalidate()
 
-    def compatible(self, name, shape):
+    def raw_compatible(self, name, shape):
         return [image for image in self.samples[name] if image.shape == shape]
+
+    def raw_view(self):
+        return self._raw_proxy
+
+    def compatible(self, name, shape):
+        """Derive enhanced references once, while retaining original E/F files.
+
+        Current detector inputs must receive the same transform externally.
+        The callable must retain image shape and dtype, and may modify its copy.
+        """
+        if self.image_transform is None:
+            return self.raw_compatible(name, shape)
+        key = (name, tuple(shape))
+        if key not in self._image_cache:
+            derived = []
+            for image in self.raw_compatible(name, shape):
+                transformed = self.image_transform(image.copy())
+                if (not isinstance(transformed, np.ndarray)
+                        or transformed.shape != image.shape or transformed.dtype != image.dtype):
+                    raise ValueError('Reference image transform must preserve shape and dtype')
+                derived.append(transformed.copy())
+            self._image_cache[key] = derived
+        return self._image_cache[key]
 
     def features(self, name, shape):
         key = (name, tuple(shape))

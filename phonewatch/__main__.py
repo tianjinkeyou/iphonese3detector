@@ -21,6 +21,8 @@ def parse_args():
     parser.add_argument("--model", default="yolo11n.pt", help="Ultralytics model path (first run downloads weights)")
     parser.add_argument("--detector", choices=("auto", "smart", "smart-watch", "reference", "yolo"), default="auto", help="smart: phone detection; smart-watch: optional hand proximity, suspect time/photos; reference: R/E/F only")
     parser.add_argument("--detection-mode", choices=("robust", "fast"), default="robust", help="robust: rotation/low-light fallback; fast: single view")
+    parser.add_argument("--image-mode", choices=("off", "adaptive"), default="off", help="optional software shadow/contrast/noise enhancement; V compares previews")
+    parser.add_argument("--image-strength", type=float, default=0.5, help="image enhancement strength in [0,1]; default 0.5")
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--watch-screen", action="store_true", help="optional screen-motion signal for smart-watch; S calibrates screen corners")
     parser.add_argument("--hand-mode", choices=("robust", "landmarks"), default="robust", help="robust: crop/rotation and partial hand candidates; landmarks: full-frame only")
@@ -40,6 +42,8 @@ def parse_args():
         parser.error("--watch-screen requires --detector smart-watch")
     if not math.isfinite(args.screen_threshold) or not 0 < args.screen_threshold <= 1:
         parser.error("screen-threshold must be in (0,1]")
+    if not math.isfinite(args.image_strength) or not 0 <= args.image_strength <= 1:
+        parser.error("image-strength must be in [0,1]")
     if args.roi and (min(args.roi[:2]) < 0 or min(args.roi[2:]) <= 0):
         parser.error("ROI needs nonnegative X/Y and positive width/height")
     return args
@@ -58,6 +62,7 @@ def main():
     from .detection import PhoneDetector
     from .perspective import load_plane, save_plane, select_plane, rectify, map_polygon
     from .parking import ParkingDetector
+    from .image_enhancement import ImageEnhancer
 
     camera = int(args.camera) if args.camera.isdecimal() else args.camera
     capture = cv2.VideoCapture(camera)
@@ -77,8 +82,12 @@ def main():
     try:
         if not capture.isOpened():
             raise RuntimeError("Cannot open camera. Check --camera and Ubuntu camera permissions.")
-        references = ReferenceDetector(args.data_dir / "references")
-        parking_detector = ParkingDetector(references)
+        enhancer = ImageEnhancer(args.image_mode, args.image_strength)
+        enhancement_enabled = args.image_mode == "adaptive" and args.image_strength > 0
+        references = (ReferenceDetector(args.data_dir / "references", image_transform=enhancer.process)
+                      if enhancement_enabled else ReferenceDetector(args.data_dir / "references"))
+        # Empty parking evidence must not be created by tone processing.
+        parking_detector = ParkingDetector(references.raw_view() if enhancement_enabled else references)
         detector = None
         def make_detector():
             from ultralytics import YOLO
@@ -131,13 +140,28 @@ def main():
                          pickups=journal.pickup_total(day),absent_seconds=totals["absent"],
                          unknown_seconds=totals["unknown"],legacy_seconds=totals["legacy"],
                          suspected_seconds=store.watch_total(day),camera_available=camera_available,
-                         session_runtime_seconds=max(0.0,now-session_started),references=references.counts)
+                         session_runtime_seconds=max(0.0,now-session_started),references=references.counts,
+                         image_mode=args.image_mode,image_strength=args.image_strength)
+
+        def save_photo_pair(path, image):
+            if not cv2.imwrite(str(path),image):
+                raise RuntimeError(f"Could not save event photo: {path}")
+            details = {"photo_path": str(path.relative_to(args.data_dir))}
+            if enhancement_enabled:
+                enhanced_path = photos / "enhanced" / path.name
+                try:
+                    enhanced_path.parent.mkdir(exist_ok=True)
+                    if not cv2.imwrite(str(enhanced_path),enhancer.process(image)):
+                        raise RuntimeError(f"Could not save enhanced photo: {enhanced_path}")
+                    details["enhanced_photo_path"] = str(enhanced_path.relative_to(args.data_dir))
+                except (RuntimeError,OSError,cv2.error) as exc:
+                    details.update(enhanced_photo_path=None,enhanced_photo_error=str(exc))
+                    print(f"Raw photo saved; enhanced photo unavailable: {exc}",flush=True)
+            return details
 
         def save_event_photo(kind, at, image=None):
             path = photos / f"{kind}_{at:%Y-%m-%d_%H-%M-%S_%f}.jpg"
-            if not cv2.imwrite(str(path),frame if image is None else image):
-                raise RuntimeError(f"Could not save event photo: {path}")
-            return str(path.relative_to(args.data_dir))
+            return save_photo_pair(path,frame if image is None else image)
         if args.detector == "smart-watch":
             from .hand_tracking import HandTracker
             from .watch import WatchTimer, hand_near_polygon
@@ -175,6 +199,7 @@ def main():
         last_present_at = None
         pickup_cycle = 0
         pickup_cycle_id = None
+        preview_enhanced = enhancement_enabled
         session_started = time.monotonic()
         next_summary = session_started+300
         summary_day = datetime.now().date().isoformat()
@@ -184,6 +209,7 @@ def main():
                      pickup_unknown_gap=pickups.unknown_gap,watch_delay=args.watch_delay,
                      watch_screen=args.watch_screen,screen_threshold=args.screen_threshold,
                      hand_mode=args.hand_mode,photo_interval=args.photo_interval,
+                     image_mode=args.image_mode,image_strength=args.image_strength,enhancement=enhancer.config,
                      roi=list(roi) if roi else None,ignore_plane=args.ignore_plane,
                      references=references.counts)
         while True:
@@ -203,10 +229,10 @@ def main():
                 if not plane_checked:
                     plane = None if args.ignore_plane or args.roi else load_plane(plane_path, frame.shape)
                     plane_checked = True
-                region = frame[y:y+h, x:x+w]
+                raw_region = frame[y:y+h, x:x+w]
                 inverse = None
                 if plane is not None:
-                    region, inverse = rectify(frame, plane)
+                    raw_region, inverse = rectify(frame, plane)
                 if screen_detector is not None and not screen_checked:
                     try:
                         screen_polygon = load_plane(screen_path,frame.shape)
@@ -218,8 +244,15 @@ def main():
                     screen_in_region = (cv2.perspectiveTransform(np.float32([screen_polygon]),np.linalg.inv(inverse))[0]
                                         if inverse is not None else screen_polygon-(x,y))
                 started = time.monotonic()
+                # Process the same crop/plane as the stored raw E/F samples.
+                # Cropping an enhanced full frame would use different context.
+                region = enhancer.process(raw_region) if enhancement_enabled else raw_region
                 polygons = []
-                if args.detector in ("auto", "smart", "smart-watch"):
+                raw_quality = enhancer.describe(raw_region) if enhancement_enabled else None
+                if raw_quality is not None and (raw_quality["p95"] < 8 or raw_quality["p05"] > 245):
+                    present = None
+                    method = "raw image too dark; uncertain" if raw_quality["p95"] < 8 else "raw image overexposed; uncertain"
+                elif args.detector in ("auto", "smart", "smart-watch"):
                     present, method, polygons = smart.detect(region)
                     if present is None and screen_detector is not None and screen_polygon is not None:
                         body_present, body_label = screen_body_presence(
@@ -233,16 +266,17 @@ def main():
                         detector = make_detector()
                     polygons, method = detector.detect(region)
                     present = bool(polygons)
-                if args.pickup_mode == "parking" and parking_detector.ready(region.shape,screen_polygon=screen_in_region):
+                if args.pickup_mode == "parking" and parking_detector.ready(raw_region.shape,screen_polygon=screen_in_region):
                     pickup_observation,pickup_method,pickup_evidence = parking_detector.detect(
-                        region,phone_polygons=polygons,screen_polygon=screen_in_region)
+                        raw_region,phone_polygons=polygons,screen_polygon=screen_in_region)
                     pickup_source = "parking"
                 else:
                     pickup_observation = present
                     pickup_source = "phone_presence"
                     pickup_method = method if args.pickup_mode=="presence" else "E/F parking unavailable; presence fallback"
+                analysis_frame = enhancer.process(frame) if enhancement_enabled else frame
                 inference_ms = (time.monotonic() - started) * 1000
-                display = frame.copy()
+                display = (analysis_frame if preview_enhanced else frame).copy()
                 for polygon in polygons:
                     mapped = map_polygon(polygon, inverse) if inverse is not None else polygon + (x, y)
                     cv2.polylines(display, [mapped], True, (0, 255, 0), 2)
@@ -291,13 +325,14 @@ def main():
                         details["cycle_id"] = pickup_cycle_id
                     if kind in ("pickup","return","unobserved_change"):
                         try:
-                            details["photo_path"] = save_event_photo(kind,at)
+                            details.update(save_event_photo(kind,at))
                         except (RuntimeError,OSError,cv2.error) as exc:
                             details.update(photo_path=None,photo_error=str(exc))
                             print(f"{kind} observed; event photo unavailable: {exc}",flush=True)
                         if kind != "return" and details["from_state"]=="present" and last_present_frame is not None:
                             try:
-                                details["before_photo_path"] = save_event_photo(f"before_{kind}",at,last_present_frame)
+                                before_photo = save_event_photo(f"before_{kind}",at,last_present_frame)
+                                details.update({f"before_{name}": value for name,value in before_photo.items()})
                                 details["before_photo_time"] = last_present_at.astimezone().isoformat()
                             except (RuntimeError,OSError,cv2.error) as exc:
                                 details.update(before_photo_path=None,before_photo_error=str(exc))
@@ -328,7 +363,7 @@ def main():
                         watch_polygon = plane
                     elif roi is not None:
                         watch_polygon = np.float32([[x,y],[x+w,y],[x+w,y+h],[x,y+h]])
-                    hands = hand_tracker.detect(frame,area=watch_polygon)
+                    hands = hand_tracker.detect(analysis_frame,area=watch_polygon)
                     hand_count = len(hands)
                     hand_source = getattr(hand_tracker,"source","model")
                     if watch_polygon is not None:
@@ -383,9 +418,12 @@ def main():
                 watch_at = datetime.now()
                 photo = None
                 photo_error = None
+                photo_details = {}
                 if watch_started:
                     try:
-                        photo = save_event_photo("suspect",watch_at)
+                        saved_photo = save_event_photo("suspect",watch_at)
+                        photo = saved_photo.pop("photo_path")
+                        photo_details = saved_photo
                         print(f"Suspected use started; photo saved: {photo}",flush=True)
                     except (RuntimeError,OSError,cv2.error) as exc:
                         photo_error = str(exc)
@@ -397,7 +435,7 @@ def main():
                                  sources=sources,method=method,state=timer.state,
                                  reason="activity" if watch_timer.active else ("camera unavailable" if not available else "phone unconfirmed" if not phone_confirmed else "activity ended"),
                                  hands=hand_count,hand_source=str(hand_source),partial_candidates=candidate_count,
-                                 screen_change_fraction=screen_score,photo_path=photo,photo_error=photo_error)
+                                 screen_change_fraction=screen_score,photo_path=photo,photo_error=photo_error,**photo_details)
                 watch_total = store.watch_total(watch_at.date().isoformat())
                 if roi is None and plane is None:
                     watch_label = "WATCH: select parking area with R or P"
@@ -429,10 +467,8 @@ def main():
                 last_log = now
             if ok and frame is not None and now >= next_photo:
                 path = photos / f"{at:%Y-%m-%d_%H-%M-%S_%f}.jpg"
-                if not cv2.imwrite(str(path), frame):
-                    raise RuntimeError(f"Could not save photo: {path}")
-                record_event("photo_saved",at,reason="periodic",photo_path=str(path.relative_to(args.data_dir)),
-                             state=timer.state,method=method)
+                photo_details = save_photo_pair(path,frame)
+                record_event("photo_saved",at,reason="periodic",state=timer.state,method=method,**photo_details)
                 next_photo = now + args.photo_interval
             if last_frame is not None:
                 display = last_frame.copy()
@@ -445,6 +481,10 @@ def main():
                 parking_word = "PARKED" if pickup_observation is True else "EMPTY" if pickup_observation is False else "UNCERTAIN"
                 cv2.putText(display,f"Pickup evidence: {parking_word} ({pickup_source})",(12,335),cv2.FONT_HERSHEY_SIMPLEX,0.5,STATE_COLORS[parking_state],1)
                 cv2.putText(display,pickup_method,(12,355),cv2.FONT_HERSHEY_SIMPLEX,0.45,STATE_COLORS[parking_state],1)
+                if enhancement_enabled:
+                    view = "enhanced" if preview_enhanced else "original"
+                    image_label = f"IMAGE adaptive {args.image_strength:.2f} | {view} (V)"
+                    cv2.putText(display,image_label,(max(12,width-345),18),cv2.FONT_HERSHEY_SIMPLEX,0.42,(255,255,0),1)
                 if totals['legacy']:
                     cv2.putText(display, f"Legacy unsplit: {totals['legacy']/60:.1f} min", (12, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
                 if watch_timer is not None:
@@ -459,6 +499,9 @@ def main():
             key = cv2.waitKey(30) & 0xFF
             if key in (27, ord("q")):
                 break
+            if key == ord("v") and enhancement_enabled:
+                preview_enhanced = not preview_enhanced
+                record_event("preview_changed",view="enhanced" if preview_enhanced else "original")
             if key in (ord("c"),ord("e"),ord("f"),ord("p"),ord("r")) or (key==ord("s") and screen_detector is not None):
                 pickups.reset(time.monotonic())
                 last_present_frame = None
@@ -499,7 +542,7 @@ def main():
                     record_event("clear_requested",confirmation_seconds=3)
                     print("Press C again within 3 seconds to clear all E/F samples.",flush=True)
             if key in (ord("e"), ord("f")) and ok and frame is not None:
-                references.save("empty" if key == ord("e") else "phone", region)
+                references.save("empty" if key == ord("e") else "phone", raw_region)
                 update_usage(None,time.monotonic(),reason="reference capture")
                 clear_deadline = 0.0
                 counts = references.counts

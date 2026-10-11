@@ -40,6 +40,10 @@ class EventJournalTests(unittest.TestCase):
         self.assertIn("全程遮挡，无法可靠计次", content)
         self.assertIn("gap_recovered=true、timing_uncertain=true", content)
         self.assertIn("不含之前的 unknown 间隙", content)
+        self.assertIn("image_mode、image_strength 和 enhancement", content)
+        self.assertIn("enhanced_photo_path/before_enhanced_photo_path", content)
+        self.assertIn("已保存的原图仍保留", content)
+        self.assertIn("拿起空位判断和屏幕变化检测使用原图", content)
         self.assertIn("手机离开\\n支架", content)
         self.assertEqual(event_lines(path), [{
             "id": event_id, "time": self.at.isoformat(), "event": "pickup",

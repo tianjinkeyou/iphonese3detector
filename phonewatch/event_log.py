@@ -141,6 +141,10 @@ class EventJournal:
             "# 常用事件：state_change=状态变化；pickup=估计拿起；return=放回；unobserved_change=未连续观察到的变化。",
             "# camera_lost/camera_restored=摄像头中断/恢复；suspect_start/suspect_end=疑似使用开始/结束；photo_saved=照片保存。",
             "# session_start/session_end=程序启动/结束；calibration_start/calibration_end=校准开始/结束；summary=累计数据快照。",
+            "# 可选图像增强：session_start 记录 image_mode、image_strength 和 enhancement 参数，便于核对处理方式。",
+            "# photo_path/before_photo_path 是原图；enhanced_photo_path/before_enhanced_photo_path 是 photos/enhanced/ 下的同名处理副本。",
+            "# enhanced_photo_error/before_enhanced_photo_error 表示副本处理或保存失败；失败时已保存的原图仍保留。",
+            "# 增强不能恢复原图已丢失的细节；E/F 参考原图不改写，拿起空位判断和屏幕变化检测使用原图。",
             *self._timing_summary(day),
             "# JSON 字段：id=事件编号，time=事件时间，event=事件类型，session=运行会话，details=辅助信息。",
         ]

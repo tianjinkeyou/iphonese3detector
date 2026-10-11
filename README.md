@@ -71,6 +71,38 @@ python -m phonewatch --camera /dev/video2 --confidence 0.15 --delay 10
 
 漏检时每帧最多进行 5 次推理，老电脑可能变慢。可选 `--detection-mode fast` 恢复单次检测。降低置信度会增加误报。请分别测试倾斜放回和拿走至少十次，确认空停放区不会被误判，不能把算法增强当作准确率保证。
 
+## 可选软件画面增强
+
+`--image-mode adaptive` 对每帧进行阴影提亮、局部对比度调整和轻量空间降噪，用于改善预览及手机、手部检测输入。默认 `--image-mode off`；所有检测模式都可组合使用。`--image-strength` 范围为 0～1，默认 0.5，先用默认值观察黑色机身细节与噪点变化。开启后画面显示 `IMAGE adaptive`、强度和当前预览方式；按 **V** 可切换原始/增强预览，仅改变显示，不改变检测处理或重建基线。
+
+本地更新后，用 C920 启动：
+
+```bash
+cd "/home/hua/ドキュメント/APPS/iphonese3detector"
+git pull origin main
+source .venv/bin/activate
+python -m phonewatch --camera /dev/video2 --detector smart --image-mode adaptive
+```
+
+已经安装可选手部依赖时，也可同时开启支架上疑似使用和屏幕监测：
+
+```bash
+python -m phonewatch --camera /dev/video2 --detector smart-watch --watch-screen --image-mode adaptive
+```
+
+已有 R/P/S 校准和 E/F 原始样本继续保留，无需为了开启增强清空或重新保存。参考图比较会按当前设置从原图派生增强缓存，与当前检测区域采用相同处理；磁盘中的 E/F PNG 不会被改写。拿起统计的停放/空支架证据和屏幕变化比较仍使用原始画面，避免增强造成的亮度变化被误当作动作。
+
+原始照片仍保存到 `data/photos/`。启用 adaptive 且强度大于 0 时，还在 `data/photos/enhanced/` 保存同名增强副本，便于人工或 AI 对比；原图不会被覆盖。事件的 `photo_path` 仍指向原图，`enhanced_photo_path` 指向增强副本；拿起前画面另有 `before_enhanced_photo_path`。这些路径都相对于 `--data-dir`。增强副本保存失败时记录 `enhanced_photo_error` 或 `before_enhanced_photo_error`，不影响原图及已确认的次数。会话日志同时记录 `image_mode`、`image_strength` 和增强配置。
+
+觉得画面太强，可退出后降低强度；关闭这项增强可回到原有输入处理：
+
+```bash
+python -m phonewatch --camera /dev/video2 --detector smart --image-mode adaptive --image-strength 0.25
+python -m phonewatch --camera /dev/video2 --detector smart --image-mode off
+```
+
+这是软件处理，不调整摄像头曝光、增益或白平衡，也不是传感器 HDR。严重过曝、全黑或未拍到的细节无法恢复；原始采集画面过暗或过曝时，仍保留 UNKNOWN 保护。增强可能突出噪点，需在实机测试黑屏手机、空支架和不同光线。原有 `--detection-mode robust` 的弱光及旋转检测回退继续保留。
+
 ## 手机斜靠在支架上：四点透视校准
 
 1. 固定摄像头和支架，将手机放到正常停放位置，尽量露出完整正面或背面。
